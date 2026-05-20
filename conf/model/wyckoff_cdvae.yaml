@@ -1,0 +1,28 @@
+_target_: cdvae.pl_modules.model.WyckoffCDVAE
+
+# 模型结构
+latent_dim: 256
+hidden_dim: 256
+max_wyckoff_sites: 12   # 每个晶体最多预测的wyckoff位点数
+fc_num_layers: 3
+
+
+# 损失权重
+beta: 0.01           # KL 权重，对应原版 hparams.beta
+cost_property: 1.0   # 属性损失权重
+
+# Wyckoff 各子损失权重
+w_spg: 1.0
+w_lattice: 1.0
+w_elem: 0.1
+w_letter: 1.0
+w_free: 1.0
+
+# 数据
+use_wyckoff: true
+predict_property: false
+
+# 保留原始 CDVAE 中 BaseModule 需要的字段
+# （从 vae.yaml 继承，避免 hparams 缺失）
+max_atoms: ${data.max_atoms}
+teacher_forcing_max_epoch: ${data.teacher_forcing_max_epoch}

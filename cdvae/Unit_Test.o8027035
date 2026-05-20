@@ -1,0 +1,57 @@
+/srv/scratch/z5561341/miniconda3/envs/cdvae/lib/python3.9/site-packages/torchmetrics/utilities/imports.py:21: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import DistributionNotFound, get_distribution
+==================================================
+Wyckoff-CDVAE test
+==================================================
+
+[data] batch parameters: ['num_wyk_sites', 'spg_idx', 'wyk_atom_types_ptr', 'wyk_atom_types', 'wyk_free', 'wyk_lattice', 'wyk_multi', 'y', 'wyk_atom_types_batch', 'wyk_letters']
+       wyk_atom_types_batch: tensor([0, 0, 0, 1, 1])
+
+[1] Encoder test
+Encoder: mu torch.Size([2, 64]), log_var torch.Size([2, 64])
+
+[2] Decoder test
+Decoder: all correct
+
+[3] Loss test
+ Loss: total=14.9870
+   loss_spg: 5.5355
+   loss_lattice: 0.6225
+   loss_nsites: 1.4484
+   loss_elem: 4.6029
+   loss_letter: 3.2597
+   loss_free: 0.2422
+
+[4] Generate test
+ Generate:  3 structures
+   structure0: spg=63, elements=['Sm', 'Cr', 'Sr', 'Tb'], letters=['l', 'h', 'c', 'k']
+   structure1: spg=26, elements=['Sm', 'Cr'], letters=['l', 'h']
+   structure2: spg=27, elements=['Al', 'Cr'], letters=['l', 'h']
+
+==================================================
+pass，next training
+==================================================
+
+================================================================================
+                     Resource Usage on 17/05/2026 21:52:46                      
+
+Job Id: 8027035 
+Queue: SPREE
+Walltime: 00:01:01  (requested 01:00:00)
+Job execution was successful. Exit Status 0. 
+
+--------------------------------------------------------------------------------
+|              |             GPUs              |            Memory             |
+--------------------------------------------------------------------------------
+| Node  GPU ID | Requested   Used   Efficiency | Available   Used              |
+| k099    2    |     1        0.0       0%     |143771 MiB   0.0B              |
+--------------------------------------------------------------------------------
+|Total         |     1        0.0      0.0%    |                               |
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+|              |             CPUs              |            Memory             |
+--------------------------------------------------------------------------------
+| Node         | Requested   Used   Efficiency | Requested   Used   Efficiency |
+| k099         |     2        0.1      5.0%    |   8.0gb     0.4gb     5.0%    |
+--------------------------------------------------------------------------------

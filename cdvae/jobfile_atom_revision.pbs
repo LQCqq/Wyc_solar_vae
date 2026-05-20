@@ -1,0 +1,21 @@
+#!/bin/bash
+
+#PBS -N Wyckoff_Training
+
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
+
+#PBS -l walltime=12:00:00
+
+#PBS -M z5561341@ad.unsw.edu.au
+
+#PBS -m ae
+
+#PBS -j oe
+
+cd /srv/scratch/z5561341/projectA/cdvae/cdvae
+source /srv/scratch/z5561341/miniconda3/bin/activate
+conda activate cdvae
+
+CKPT="/srv/scratch/z5561341/cdvae_outputs/hydra/singlerun/2026-05-19/test_wyckoff/epoch=59-step=6359.ckpt"
+
+WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled

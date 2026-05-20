@@ -1,0 +1,33 @@
+# generated using pymatgen
+data_In2CuTe3Br
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   6.20639800
+_cell_length_b   6.22516729
+_cell_length_c   7.55744429
+_cell_angle_alpha   114.27280561
+_cell_angle_beta   112.96385053
+_cell_angle_gamma   90.69827070
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   In2CuTe3Br
+_chemical_formula_sum   'In2 Cu1 Te3 Br1'
+_cell_volume   239.84619901
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  In  In0  1  0.98410200  0.98675900  0.01070800  1
+  In  In1  1  0.24818300  0.25465300  0.47879300  1
+  Cu  Cu2  1  0.52128200  0.51515800  0.01220500  1
+  Te  Te3  1  0.41391100  0.64836000  0.25232500  1
+  Te  Te4  1  0.82564400  0.12038200  0.25829900  1
+  Te  Te5  1  0.62014800  0.84992200  0.72950400  1
+  Br  Br6  1  0.13672900  0.37476500  0.75816600  1
