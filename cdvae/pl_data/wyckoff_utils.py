@@ -11,13 +11,7 @@ MAX_WYCKOFF_SITES = 27
 
 
 def structure_to_wyckoff(structure: Structure, tol: float = 0.1):
-    """
-    pymatgen Structure to wyckoff 
-    tol 用 0.1 /0.5, MP_20
-    """
     crystal = pyxtal()
-
-    # 三个tol级别
     last_err = None
     for t in [tol, 0.3, 0.5]:
         try:
@@ -53,13 +47,9 @@ def structure_to_wyckoff(structure: Structure, tol: float = 0.1):
 
 
 def encode_wyckoff_tensors(wyckoff_dict):
-    """
-    Wyckoff to tensor
-    """
     spg_idx = torch.tensor(
         [wyckoff_dict['spacegroup_num'] - 1], dtype=torch.long
     )
-
     n = wyckoff_dict['num_sites']
     atom_types = torch.tensor(
         [Element(e).Z for e in wyckoff_dict['site_elements']], dtype=torch.long
@@ -71,47 +61,113 @@ def encode_wyckoff_tensors(wyckoff_dict):
     multiplicities = torch.tensor(
         wyckoff_dict['site_multiplicities'], dtype=torch.float32
     )
-
-    # free要3维
     free_params = torch.zeros(n, 3, dtype=torch.float32)
     for i, fp in enumerate(wyckoff_dict['site_free_params']):
         fp_t = torch.tensor(fp, dtype=torch.float32)
         free_params[i, :len(fp_t)] = fp_t
 
     return {
-        'spg_idx':       spg_idx,
-        'atom_types':    atom_types,
-        'letter_idx':    letter_idx,
+        'spg_idx':        spg_idx,
+        'atom_types':     atom_types,
+        'letter_idx':     letter_idx,
         'multiplicities': multiplicities,
-        'free_params':   free_params,
+        'free_params':    free_params,
         'lattice_params': torch.tensor(wyckoff_dict['lattice_params']),
-        'num_sites':     n,
+        'num_sites':      n,
     }
+
+
+def _unwrap_pymatgen(result):
+    """递归展开嵌套 list，直到得到 Structure 或 None"""
+    while isinstance(result, list):
+        if len(result) == 0:
+            return None
+        result = result[0]
+    if isinstance(result, Structure):
+        return result
+    return None
 
 
 def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
                           site_free_params, lattice_params):
     """
-    Wyckoff to pymatgen Structure。
+    Wyckoff to pymatgen Structure.
     """
     crystal = pyxtal()
-    a, b, c, alpha, beta, gamma = lattice_params.tolist()
 
+    if hasattr(lattice_params, 'cpu'):
+        lp = lattice_params.cpu().numpy()
+    else:
+        lp = np.array(lattice_params)
+    a, b, c, alpha, beta, gamma = [float(x) for x in lp]
+
+    # 按元素分组，保留 Wyckoff letter
     element_sites = {}
-    for elem, letter, free in zip(site_elements, site_letters, site_free_params):
+    for elem, letter in zip(site_elements, site_letters):
         if elem not in element_sites:
             element_sites[elem] = []
-        element_sites[elem].append((letter, free.tolist()))
+        element_sites[elem].append(letter)
 
-    species, numIons = [], []
-    for elem, sites in element_sites.items():
-        g = Group(spacegroup_num)
-        count = sum(g[letter].multiplicity for letter, _ in sites)
-        species.append(elem)
+    species = list(element_sites.keys())
+    sites   = [element_sites[e] for e in species]
+
+    # 计算 numIons
+    g = Group(spacegroup_num)
+    numIons = []
+    for elem_letters in sites:
+        count = 0
+        for letter in elem_letters:
+            try:
+                count += g[letter].multiplicity
+            except Exception:
+                count += 1
         numIons.append(count)
 
-    crystal.from_random(
-        3, spacegroup_num, species, numIons,
-        lattice=[a, b, c, alpha, beta, gamma],
-    )
-    return crystal.to_pymatgen()
+    # 先尝试指定 sites
+    try:
+        crystal.from_random(
+            3, spacegroup_num, species, numIons,
+            sites=sites,
+            lattice=[a, b, c, alpha, beta, gamma],
+        )
+        result = _unwrap_pymatgen(crystal.to_pymatgen())
+        if result is not None:
+            return result
+    except Exception:
+        pass
+
+    # fallback: 不指定 sites
+    try:
+        crystal.from_random(
+            3, spacegroup_num, species, numIons,
+            lattice=[a, b, c, alpha, beta, gamma],
+        )
+        return _unwrap_pymatgen(crystal.to_pymatgen())
+    except Exception:
+        pass
+
+    # 最终 fallback: 从 atom_sites 直接构建
+    try:
+        from pymatgen.core import Lattice
+        lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma)
+        sp, coords = [], []
+        for site in crystal.atom_sites:
+            for coord in site.coords:
+                sp.append(site.specie)
+                coords.append(coord)
+        if sp:
+            return Structure(lattice, sp, coords)
+    except Exception as e:
+        print(f'[DEBUG] fallback failed: {e}')
+
+    # 最终 fallback：完全不指定 lattice，让 PyXtal 自由生成
+    try:
+        crystal2 = pyxtal()
+        crystal2.from_random(3, spacegroup_num, species, numIons)
+        result = _unwrap_pymatgen(crystal2.to_pymatgen())
+        if result is not None:
+            return result
+    except Exception:
+        pass
+
+    return None

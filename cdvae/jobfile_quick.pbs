@@ -12,7 +12,12 @@
 
 #PBS -j oe
 
-cd /srv/scratch/z5561341/projectA/cdvae/cdvae
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae
-WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled
+#export HYDRA_JOBS=/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra
+TODAY=$(date +%Y-%m-%d)
+OUTDIR="/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/${TODAY}/test_wyckoff"
+mkdir -p ${OUTDIR}
+WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled "hydra.run.dir=${OUTDIR}"
+#WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled

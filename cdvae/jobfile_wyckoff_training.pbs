@@ -12,7 +12,7 @@
 
 #PBS -j oe
 
-cd /srv/scratch/z5561341/projectA/cdvae/cdvae
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae
-WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled
+WANDB_API_KEY="" WANDB_MODE=sdisabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled

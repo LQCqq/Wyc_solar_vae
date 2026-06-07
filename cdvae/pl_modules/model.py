@@ -3,6 +3,7 @@ from typing import Any, Dict
 import hydra
 import numpy as np
 import omegaconf
+import random
 import torch
 import pytorch_lightning as pl
 import torch.nn as nn
@@ -143,6 +144,7 @@ class WyckoffCDVAE(BaseModule):
         self.encoder = WyckoffEmbedding(
             hidden_dim=self.hparams.hidden_dim,
             latent_dim=self.hparams.latent_dim,
+            max_sites=self.hparams.max_wyckoff_sites,
         )
 
         # decorder：WyckoffDecoder
@@ -161,6 +163,9 @@ class WyckoffCDVAE(BaseModule):
             w_free=self.hparams.w_free,
         )
 
+        # diffusion步数
+        self.T = 100
+
         # predict, 选择用
         if self.hparams.predict_property:
             self.fc_property = build_mlp(
@@ -177,17 +182,55 @@ class WyckoffCDVAE(BaseModule):
         return mu + eps * std
 
     def forward(self, batch):
-        # encoder
-        mu, log_var = self.encoder(batch)
+        B = batch.num_wyk_sites.shape[0]
+        device = batch.wyk_atom_types.device
+        N = batch.wyk_atom_types.shape[0]  # 总位点数
+
+        # 多步masked diffusion：采样全局时间步 t ~ Uniform(1, T)
+        t = torch.randint(1, self.T + 1, (1,), device=device)  # 全局单一时间步
+        t_batch = t.expand(B)  # (B,) 同一个t广播给所有晶体
+        mask_prob = t.float() / self.T  # 标量
+        elem_mask = torch.rand(N, device=device) < mask_prob  # (N,) flat mask
+
+        # encoder：接收干净完整数据（真正的diffusion：噪声进decoder，不进encoder）
+        mu, log_var, enc_site_feats, enc_padding_mask = self.encoder(batch)
         z = self.reparameterize(mu, log_var)
 
-        # decoder
-        preds = self.decoder(z)
-
+        # 先获取targets（decoder需要noisy_elem_ids作为条件输入）
         targets, site_mask = self._prepare_targets(batch)
 
+        # 将flat elem_mask转换为(B, max_sites)格式，用于loss加权和noisy输入
+        S = self.decoder.max_sites
+        masked_sites = torch.zeros(B, S, dtype=torch.bool, device=device)
+        num_sites_safe = batch.num_wyk_sites.view(-1).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(0, 100).long()
+        site_batch_idx = torch.repeat_interleave(
+            torch.arange(B, device=device), num_sites_safe
+        )
+        for i in range(B):
+            sel = (site_batch_idx == i)
+            n = min(int(sel.sum().item()), S)
+            masked_sites[i, :n] = elem_mask[sel[:N]][:n] if sel.sum() > 0 else masked_sites[i, :n]
+
+        # 构建noisy_elem_ids：masked位点置0（MASK token），其余保留原始元素ID
+        noisy_elem_ids = targets['elem_target'].clone()  # (B, max_sites)
+        noisy_elem_ids[masked_sites] = 0  # 0 = MASK token
+
+        # letter diffusion: 同一批masked位点也mask letter
+        noisy_letter_ids = targets['letter_target'].clone()  # (B, max_sites)
+        noisy_letter_ids[masked_sites] = 0  # 0 = MASK token
+
+        # decoder：接收noisy元素作为条件（真正的diffusion去噪）+ encoder site特征（cross-attention）
+        # decoder：接收noisy条件 + encoder site特征（cross-attention）
+        preds = self.decoder(
+            z, t=t_batch,
+            noisy_elem_ids=noisy_elem_ids,
+            noisy_letter_ids=noisy_letter_ids,
+            enc_site_feats=enc_site_feats,
+            enc_padding_mask=enc_padding_mask,
+        )
+
         # loss conduct
-        recon_loss, loss_dict = self.recon_loss(preds, targets, site_mask)
+        recon_loss, loss_dict = self.recon_loss(preds, targets, site_mask, masked_sites=masked_sites)
 
         # KL 
         kld_loss = self.kld_loss(mu, log_var)
@@ -215,6 +258,7 @@ class WyckoffCDVAE(BaseModule):
         S = self.decoder.max_sites
         device = batch.num_wyk_sites.device
 
+        batch.num_wyk_sites = batch.num_wyk_sites.view(-1).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(0, 100).long()
         site_batch_idx = torch.repeat_interleave(
             torch.arange(B, device=device),
             batch.num_wyk_sites

@@ -7,7 +7,8 @@ import torch.nn.functional as F
 class WyckoffReconLoss(nn.Module):
     def __init__(self, 
                  w_spg=1.0, w_lattice=1.0, w_elem=1.0, 
-                 w_letter=1.0, w_free=1.0, w_nsites=0.5):
+                 w_letter=1.0, w_free=1.0, w_nsites=0.5,
+                 mask_weight=3.0):
         super().__init__()
         self.w_spg = w_spg
         self.w_lattice = w_lattice
@@ -15,8 +16,9 @@ class WyckoffReconLoss(nn.Module):
         self.w_letter = w_letter
         self.w_free = w_free
         self.w_nsites = w_nsites
+        self.mask_weight = mask_weight
 
-    def forward(self, preds, targets, site_mask):
+    def forward(self, preds, targets, site_mask, masked_sites=None):
         """
         preds: dict from WyckoffDecoder.forward()
         targets: dict with ground truth tensors
@@ -27,6 +29,7 @@ class WyckoffReconLoss(nn.Module):
           - letter_target: (B, max_sites) long
           - free_target: (B, max_sites, 3) float
         site_mask: (B, max_sites) bool，有效位点为True
+        masked_sites: (B, max_sites) bool，本步diffusion中被mask的位点为True
         """
 
         # sp_loss
@@ -54,7 +57,13 @@ class WyckoffReconLoss(nn.Module):
             targets['elem_target'].view(-1),
             reduction='none'
         ).view_as(site_mask)
-        loss_elem = (elem_loss * mask).sum() / mask.sum().clamp(min=1)
+        # masked位点给予更高权重，强化diffusion去噪信号
+        if masked_sites is not None:
+            elem_weight = mask.clone()
+            elem_weight[masked_sites & site_mask] = self.mask_weight
+        else:
+            elem_weight = mask
+        loss_elem = (elem_loss * elem_weight).sum() / elem_weight.sum().clamp(min=1)
         
         # wyckoff_letter_loss
         letter_loss = F.cross_entropy(
@@ -62,7 +71,13 @@ class WyckoffReconLoss(nn.Module):
             targets['letter_target'].view(-1),
             reduction='none'
         ).view_as(site_mask)
-        loss_letter = (letter_loss * mask).sum() / mask.sum().clamp(min=1)
+        # masked位点给予更高权重（letter也参与diffusion）
+        if masked_sites is not None:
+            letter_weight = mask.clone()
+            letter_weight[masked_sites & site_mask] = self.mask_weight
+        else:
+            letter_weight = mask
+        loss_letter = (letter_loss * letter_weight).sum() / letter_weight.sum().clamp(min=1)
         
         # free_loss
         free_loss = F.mse_loss(

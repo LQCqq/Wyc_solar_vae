@@ -1,3 +1,20 @@
+import numpy as _np
+
+def _fix_lattice(lp):
+    """角度从弧度转为角度制，确保物理合理性"""
+    lp = lp.copy()
+    # 反归一化：训练时loss用了 pred/[10,10,10,90,90,90]，这里还原
+    lp[:3] = lp[:3] * 10.0
+    lp[3:] = lp[3:] * 90.0
+    # 长度：确保正值，合理范围
+    lp[:3] = _np.abs(lp[:3])
+    lp[:3] = _np.clip(lp[:3], 1.0, 30.0)
+    # 角度：如果是弧度制（< π）则转为角度制
+    if _np.all(lp[3:] < _np.pi * 1.1):
+        lp[3:] = _np.degrees(lp[3:])
+    lp[3:] = _np.clip(lp[3:], 30.0, 150.0)
+    return lp
+
 # models/wyckoff_decoder.py
 import torch
 import torch.nn as nn
@@ -15,7 +32,7 @@ class WyckoffDecoder(nn.Module):
         self,
         latent_dim: int = 256,
         hidden_dim: int = 256,
-        max_sites: int = 8,        # 每个晶体最多预测的Wyckoff位点数
+        max_sites: int = 12,        # 每个晶体最多预测的Wyckoff位点数
         num_spg: int = 230,
         num_wyckoff_letters: int = 27,
         num_elements: int = 100,
@@ -59,19 +76,58 @@ class WyckoffDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         
-        # 位点预测head（并行 max_sites 个）
-        self.element_head = nn.Linear(hidden_dim, num_elements * max_sites)
-        self.letter_head = nn.Linear(hidden_dim, num_wyckoff_letters * max_sites)
-        self.free_param_head = nn.Linear(hidden_dim, 3 * max_sites)
+        # 位点预测head,并行 max_sites个
+        #self.element_head = nn.Linear(hidden_dim, num_elements * max_sites)
+        #self.letter_head = nn.Linear(hidden_dim, num_wyckoff_letters * max_sites)
+        #self.free_param_head = nn.Linear(hidden_dim, 3 * max_sites)
 
-    def forward(self, z):
+
+        self.site_pos_emb = nn.Embedding(max_sites, hidden_dim)
+        self.site_fusion = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+        self.element_head =nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, num_elements),
+        )
+        self.letter_head = nn.Linear(hidden_dim, num_wyckoff_letters)
+        self.free_param_head = nn.Linear(hidden_dim, 3)
+
+        # diffusion时间步embedding
+        self.T = 100
+        self.time_emb = nn.Embedding(self.T + 1, hidden_dim)
+
+        # 真正的diffusion：decoder接收noisy元素作为条件输入
+        # index 0 = MASK token，index 1-100 = 实际元素
+        self.noisy_elem_emb = nn.Embedding(num_elements + 1, hidden_dim // 4)
+        self.noisy_elem_proj = nn.Linear(hidden_dim // 4, hidden_dim)
+
+        # letter diffusion：decoder接收noisy letter作为条件输入
+        # index 0 = MASK token，index 1-27 = 实际letter
+        self.noisy_letter_emb = nn.Embedding(num_wyckoff_letters + 1, hidden_dim // 4)
+        self.noisy_letter_proj = nn.Linear(hidden_dim // 4, hidden_dim)
+
+        # cross-attention：decoder site特征attend到encoder per-site特征
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
+        self.cross_attn_norm = nn.LayerNorm(hidden_dim)
+
+
+    def forward(self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None, enc_site_feats=None, enc_padding_mask=None):
         """
         z: (B, latent_dim)
         Returns dict of predictions (logits)
         """
         B = z.shape[0]
         h = self.fc_shared(z)  # (B, D)
-        
+
+        # 加入时间步条件
+        if t is not None:
+            h = h + self.time_emb(t)
+
         # 预测空间群
         spg_logits = self.spg_head(h)  # (B, 230)
         
@@ -85,10 +141,36 @@ class WyckoffDecoder(nn.Module):
         site_h = self.site_decoder(h)  # (B, D)
         
         # 展开为每个位点的预测
-        elem_logits = self.element_head(site_h).view(B, self.max_sites, self.num_elements)
-        letter_logits = self.letter_head(site_h).view(B, self.max_sites, self.num_letters)
-        free_params = self.free_param_head(site_h).view(B, self.max_sites, 3)
-        free_params = torch.sigmoid(free_params)  # 自由参数在 [0, 1)
+        #elem_logits = self.element_head(site_h).view(B, self.max_sites, self.num_elements)
+        #letter_logits = self.letter_head(site_h).view(B, self.max_sites, self.num_letters)
+        #free_params = self.free_param_head(site_h).view(B, self.max_sites, 3)
+        #free_params = torch.sigmoid(free_params)  # 自由参数在 [0, 1)
+                
+        pos = self.site_pos_emb.weight
+        site_feats = site_h.unsqueeze(1) + pos.unsqueeze(0)
+        # 加入noisy元素条件（真正的diffusion去噪信号）
+        if noisy_elem_ids is not None:
+            noisy_feats = self.noisy_elem_emb(noisy_elem_ids)     # (B, max_sites, D/4)
+            noisy_feats = self.noisy_elem_proj(noisy_feats)        # (B, max_sites, D)
+            site_feats = site_feats + noisy_feats
+        # 加入noisy letter条件（letter diffusion去噪信号）
+        if noisy_letter_ids is not None:
+            noisy_letter_feats = self.noisy_letter_emb(noisy_letter_ids)    # (B, max_sites, D/4)
+            noisy_letter_feats = self.noisy_letter_proj(noisy_letter_feats)  # (B, max_sites, D)
+            site_feats = site_feats + noisy_letter_feats
+        site_feats = self.site_fusion(site_feats)
+
+        # cross-attention：decoder site特征attend到encoder per-site特征
+        if enc_site_feats is not None:
+            ca_out, _ = self.cross_attn(
+                site_feats, enc_site_feats, enc_site_feats,
+                key_padding_mask=enc_padding_mask
+            )
+            site_feats = self.cross_attn_norm(site_feats + ca_out)
+
+        elem_logits = self.element_head(site_feats)
+        letter_logits = self.letter_head(site_feats)
+        free_params = torch.sigmoid(self.free_param_head(site_feats))
         
         return {
             'spg_logits': spg_logits,           # (B, 230)
@@ -100,42 +182,111 @@ class WyckoffDecoder(nn.Module):
         }
 
     @torch.no_grad()
-    def decode_to_wyckoff(self, z, temperature=1.0):
-        preds = self.forward(z)
+    def decode_to_wyckoff(self, z, temperature=0.5):
         B = z.shape[0]
-        
+        device = z.device
+
+        # 预测SPG（固定用于letter约束，避免每步重复查询）
+        h_init = self.fc_shared(z)
+        spg_logits_init = self.spg_head(h_init)
+        spg_nums = spg_logits_init.argmax(-1) + 1  # (B,) 1-indexed
+
+        # 构建SPG-letter合法性mask（预缓存所有晶体）
+        def build_spg_letter_mask(spg_num, num_letters, device):
+            """返回该SPG合法的letter的0/1 mask"""
+            try:
+                from pyxtal.symmetry import Group
+                g = Group(int(spg_num))
+                mask = torch.zeros(num_letters, device=device)
+                for i in range(len(g.Wyckoff_positions)):
+                    if i < num_letters:
+                        mask[i] = 1.0
+                return mask if mask.sum() > 0 else torch.ones(num_letters, device=device)
+            except:
+                return torch.ones(num_letters, device=device)
+
+        letter_masks = torch.stack([
+            build_spg_letter_mask(spg_nums[b].item(), self.num_letters, device)
+            for b in range(B)
+        ])  # (B, num_letters)
+
+        # 真正的diffusion生成：从全MASK开始，迭代去噪（elem和letter同步）
+        noisy_elem_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
+        noisy_letter_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
+
+        # 迭代去噪：t从T到1
+        for step in range(self.T, 0, -1):
+            t = torch.full((B,), step, dtype=torch.long, device=device)
+            preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids)
+
+            # 对所有位点采样元素（向量化）
+            elem_probs = torch.softmax(preds['elem_logits'] / temperature, dim=-1)  # (B, S, 100)
+            B_, S_, V_ = elem_probs.shape
+            sampled_elems = torch.multinomial(
+                elem_probs.view(-1, V_), 1
+            ).view(B_, S_) + 1  # 1-indexed元素ID
+
+            # 对所有位点采样letter（SPG约束）
+            letter_probs = torch.softmax(preds['letter_logits'] / temperature, dim=-1)  # (B, S, 27)
+            letter_probs = letter_probs * letter_masks.unsqueeze(1)  # (B, S, 27)
+            letter_probs = letter_probs / letter_probs.sum(-1, keepdim=True).clamp(min=1e-8)
+            B_, S_, L_ = letter_probs.shape
+            sampled_letters = torch.multinomial(
+                letter_probs.view(-1, L_), 1
+            ).view(B_, S_) + 1  # 1-indexed letter ID
+
+            # 按当前步概率决定unmask：每步期望unmask 1/step比例
+            unmask_prob = 1.0 / step
+            should_unmask = torch.rand(B, self.max_sites, device=device) < unmask_prob
+
+            # 只更新仍是MASK(0)的位点（elem和letter同步unmask）
+            still_masked = (noisy_elem_ids == 0)
+            update = still_masked & should_unmask
+            noisy_elem_ids = torch.where(update, sampled_elems, noisy_elem_ids)
+            noisy_letter_ids = torch.where(update, sampled_letters, noisy_letter_ids)
+
+        # 最终一步：用t=1做最终预测
+        t_final = torch.ones(B, dtype=torch.long, device=device)
+        preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids)
+
         results = []
         for i in range(B):
             spg_num = preds['spg_logits'][i].argmax().item() + 1
             n_sites = preds['num_sites_logits'][i].argmax().item() + 1
-            
+
             elements = []
             letters = []
             free_params = []
             for s in range(n_sites):
-                elem_z = preds['elem_logits'][i, s].argmax().item() + 1
-                letter_idx = preds['letter_logits'][i, s].argmax().item()
+                # 优先使用去噪后的元素ID，仍为MASK则用logits
+                elem_z = noisy_elem_ids[i, s].item()
+                if elem_z == 0:
+                    elem_z = preds['elem_logits'][i, s].argmax().item() + 1
+                # 优先使用去噪后的letter ID，仍为MASK则用logits
+                letter_idx = noisy_letter_ids[i, s].item() - 1  # 转为0-indexed
+                if noisy_letter_ids[i, s].item() == 0:
+                    letter_idx = preds['letter_logits'][i, s].argmax().item()
                 fp = preds['free_params'][i, s].cpu().numpy()
-                
+
                 from pymatgen.core import Element
                 try:
                     elem = Element.from_Z(elem_z).symbol
                 except:
                     elem = 'Si'
-                    
+
                 from cdvae.pl_data.wyckoff_utils import WYCKOFF_LETTERS, wyckoff_to_structure
                 letter = WYCKOFF_LETTERS[letter_idx]
-                
+
                 elements.append(elem)
                 letters.append(letter)
                 free_params.append(fp)
-            
+
             results.append({
                 'spacegroup_num': spg_num,
                 'site_elements': elements,
                 'site_letters': letters,
                 'site_free_params': free_params,
-                'lattice_params': preds['lattice_pred'][i].cpu().numpy(),
+                'lattice_params': _fix_lattice(preds['lattice_pred'][i].cpu().numpy()),
                 'num_sites': n_sites,
             })
         return results
