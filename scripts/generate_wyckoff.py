@@ -12,8 +12,8 @@ for pyc in pathlib.Path('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA
     pyc.unlink()
 os.chdir('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae')
 
-CKPT = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-06-07/test_wyckoff/epoch=89-step=9539.ckpt'
-NUM_SAMPLES = 1000
+CKPT = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-06-12/test_wyckoff/epoch=159-step=16959.ckpt'
+NUM_SAMPLES = 2500
 OUT_DIR = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures'
 
 os.makedirs(OUT_DIR, exist_ok=True)

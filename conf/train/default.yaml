@@ -22,6 +22,7 @@ monitor_metric_mode: 'min'
 early_stopping:
   patience: ${data.early_stopping_patience} # 60
   verbose: False
+  check_finite: False
 
 model_checkpoints:
   save_top_k: 1

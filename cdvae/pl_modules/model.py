@@ -161,6 +161,9 @@ class WyckoffCDVAE(BaseModule):
             w_elem=self.hparams.w_elem,
             w_letter=self.hparams.w_letter,
             w_free=self.hparams.w_free,
+            w_nsites=getattr(self.hparams, 'w_nsites', 0.5),
+            w_overlap=getattr(self.hparams, 'w_overlap', 1.0),
+            overlap_threshold=getattr(self.hparams, 'overlap_threshold', 0.8),
         )
 
         # diffusion步数
@@ -193,7 +196,7 @@ class WyckoffCDVAE(BaseModule):
         elem_mask = torch.rand(N, device=device) < mask_prob  # (N,) flat mask
 
         # encoder：接收干净完整数据（真正的diffusion：噪声进decoder，不进encoder）
-        mu, log_var, enc_site_feats, enc_padding_mask = self.encoder(batch)
+        mu, log_var, per_site_mu, per_site_log_var, enc_padding_mask = self.encoder(batch)
         z = self.reparameterize(mu, log_var)
 
         # 先获取targets（decoder需要noisy_elem_ids作为条件输入）
@@ -202,14 +205,20 @@ class WyckoffCDVAE(BaseModule):
         # 将flat elem_mask转换为(B, max_sites)格式，用于loss加权和noisy输入
         S = self.decoder.max_sites
         masked_sites = torch.zeros(B, S, dtype=torch.bool, device=device)
-        num_sites_safe = batch.num_wyk_sites.view(-1).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(0, 100).long()
-        site_batch_idx = torch.repeat_interleave(
-            torch.arange(B, device=device), num_sites_safe
-        )
+        # _prepare_targets(在本函数201行已调用)已将batch.num_wyk_sites修正为
+        # 正确的(B,)long张量(GPU,纯拷贝得到，值正确)。site_batch_idx=repeat_interleave
+        # 产出的是单调不减序列，即每个结构i的位点在flat张量中是连续一段——
+        # 用offset连续切片(与wyckoff_encoder.py一致，已验证可用)，避免
+        # bool mask索引(tensor[bool_mask][:n])在训练(梯度跟踪)模式下触发
+        # "Expected !is_symbolic()"内部错误(验证模式下不触发，但训练时会)。
+        num_sites_cpu = batch.num_wyk_sites.cpu()
+        offset = 0
         for i in range(B):
-            sel = (site_batch_idx == i)
-            n = min(int(sel.sum().item()), S)
-            masked_sites[i, :n] = elem_mask[sel[:N]][:n] if sel.sum() > 0 else masked_sites[i, :n]
+            cnt = int(num_sites_cpu[i].item())
+            n = min(cnt, S)
+            if n > 0:
+                masked_sites[i, :n] = elem_mask[offset:offset + n]
+            offset += cnt
 
         # 构建noisy_elem_ids：masked位点置0（MASK token），其余保留原始元素ID
         noisy_elem_ids = targets['elem_target'].clone()  # (B, max_sites)
@@ -219,21 +228,37 @@ class WyckoffCDVAE(BaseModule):
         noisy_letter_ids = targets['letter_target'].clone()  # (B, max_sites)
         noisy_letter_ids[masked_sites] = 0  # 0 = MASK token
 
-        # decoder：接收noisy元素作为条件（真正的diffusion去噪）+ encoder site特征（cross-attention）
-        # decoder：接收noisy条件 + encoder site特征（cross-attention）
+        # 对per-site latent reparameterize（仅valid sites）
+        eps_site = torch.randn_like(per_site_mu)
+        per_site_z = per_site_mu + eps_site * torch.exp(0.5 * per_site_log_var)
+
+        # ── scheduled sampling：30%概率用projector替换encoder的per_site_z ──
+        # 训练site_z_projector，弥合训练/生成的分布差距
+        if self.training and torch.rand(1, device=device).item() < 0.3:
+            z_proj = self.decoder.site_z_projector(z)
+            z_proj = z_proj.unsqueeze(1).expand_as(per_site_z)
+            per_site_z = z_proj + torch.randn_like(z_proj) * 0.2
+        # ────────────────────────────────────────────────────────
+
+        # decoder：noisy条件 + per-site latent z（训练/生成一致，无shortcut）
         preds = self.decoder(
             z, t=t_batch,
             noisy_elem_ids=noisy_elem_ids,
             noisy_letter_ids=noisy_letter_ids,
-            enc_site_feats=enc_site_feats,
+            per_site_z=per_site_z,
             enc_padding_mask=enc_padding_mask,
         )
 
         # loss conduct
         recon_loss, loss_dict = self.recon_loss(preds, targets, site_mask, masked_sites=masked_sites)
 
-        # KL 
+        # Global KL
         kld_loss = self.kld_loss(mu, log_var)
+
+        # Per-site KL（只对valid sites计算）
+        site_valid = ~enc_padding_mask  # (B, max_sites), True=valid
+        kld_site = -0.5 * (1 + per_site_log_var - per_site_mu.pow(2) - per_site_log_var.exp())
+        kld_site = (kld_site * site_valid.unsqueeze(-1).float()).sum() / site_valid.float().sum().clamp(min=1)
 
         if self.hparams.predict_property and hasattr(batch, 'y'):
             property_loss = F.mse_loss(self.fc_property(z).squeeze(-1), batch.y)
@@ -244,12 +269,15 @@ class WyckoffCDVAE(BaseModule):
         total_loss = (
             recon_loss
             + self.hparams.beta * kld_loss
+            + self.hparams.beta * 0.1 * kld_site
             + self.hparams.cost_property * property_loss
         )
 
         loss_dict.update({
             'kld_loss': kld_loss,
+            'kld_site': kld_site,
             'property_loss': property_loss,
+            'recon_loss': recon_loss.detach(),  # 诊断用：确认recon项是否进入total_loss
         })
         return total_loss, loss_dict
 
@@ -258,30 +286,79 @@ class WyckoffCDVAE(BaseModule):
         S = self.decoder.max_sites
         device = batch.num_wyk_sites.device
 
-        batch.num_wyk_sites = batch.num_wyk_sites.view(-1).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(0, 100).long()
-        site_batch_idx = torch.repeat_interleave(
-            torch.arange(B, device=device),
-            batch.num_wyk_sites
+        # ─── 全部 batch.* 字段统一走 CPU 链路 ────────────────────────────────
+        # 已知问题：nan_to_num / clamp / .long() 等操作在本机(H200/sm_90)GPU
+        # 上不稳定，会产出垃圾值或NaN。num_wyk_sites 此前已修；这里对剩余所有
+        # 未防护的字段补齐同款处理：先 .cpu()，在CPU上做数值清洗，再 .to(device)
+        # 纯拷贝。每个字段的 nan_to_num 兜底值选取原则：
+        #   - 整数索引(spg/elem/letter)：nan→0, 再clamp到合法范围，.long()
+        #   - 浮点坐标(lattice/free)   ：nan/inf→0.0，不额外clamp(保留数据集原值)
+        # num_wyk_sites_cpu留作下方 num_sites_target 复用。
+        num_wyk_sites_cpu = (
+            batch.num_wyk_sites.cpu().view(-1)
+            .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            .clamp(0, 100).long()
         )
+        batch.num_wyk_sites = num_wyk_sites_cpu.to(device)
+
+        # spg_idx: 0-indexed整数(0..229)，NaN/越界→0
+        spg_idx_cpu = (
+            batch.spg_idx.cpu().view(-1)
+            .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            .clamp(0, 229).long()
+        )
+
+        # wyk_lattice: (N_total, 6) 或 (B, 6) 浮点，直接nan_to_num后reshape
+        # 这是 test_loss_lattice=nan 的直接根因：H200/sm_90 上 batch.wyk_lattice
+        # 未经保护直接 .view(B,6) 传入 F.mse_loss，NaN原样污染 loss_lattice。
+        lattice_cpu = (
+            batch.wyk_lattice.cpu()
+            .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            .view(B, 6)
+        )
+
+        # wyk_atom_types / wyk_letters / wyk_free: flat张量，CPU清洗后在循环里切片
+        atom_types_cpu = (
+            batch.wyk_atom_types.cpu()
+            .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            .clamp(0, 1000).long()          # 元素ID上界宽松，clamp防越界即可
+        )
+        letters_cpu = (
+            batch.wyk_letters.cpu()
+            .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+            .clamp(0, 51).long()            # Wyckoff letter: 0..51(a..Z)
+        )
+        free_cpu = (
+            batch.wyk_free.cpu()
+            .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
+        )
+        # ──────────────────────────────────────────────────────────────────────
 
         elem_target   = torch.zeros(B, S, dtype=torch.long, device=device)
         letter_target = torch.zeros(B, S, dtype=torch.long, device=device)
         free_target   = torch.zeros(B, S, 3,                device=device)
         site_mask     = torch.zeros(B, S, dtype=torch.bool, device=device)
 
+        # site_batch_idx(repeat_interleave产出的单调不减序列)在flat张量中每个
+        # 结构i对应连续一段——用offset连续切片(与wyckoff_encoder.py一致，已验证
+        # 可用)，避免tensor[bool_mask][:n]在训练模式下触发"Expected !is_symbolic()"。
+        offset = 0
         for i in range(B):
-            sel = (site_batch_idx == i)
-            n   = min(int(sel.sum().item()), S)
-            elem_target[i,   :n]    = batch.wyk_atom_types[sel][:n]
-            letter_target[i, :n]    = batch.wyk_letters[sel][:n]
-            free_target[i,   :n, :] = batch.wyk_free[sel][:n]
-            site_mask[i,     :n]    = True
+            cnt = int(num_wyk_sites_cpu[i].item())
+            n   = min(cnt, S)
+            if n > 0:
+                elem_target[i,   :n]    = atom_types_cpu[offset:offset + n].to(device)
+                letter_target[i, :n]    = letters_cpu[offset:offset + n].to(device)
+                free_target[i,   :n, :] = free_cpu[offset:offset + n].to(device)
+                site_mask[i,     :n]    = True
+            offset += cnt
 
-        num_sites_target = (batch.num_wyk_sites - 1).clamp(0, S - 1)
+        # 同上：用CPU上的num_wyk_sites_cpu算，避免GPU上.clamp()链路问题，再.to(device)。
+        num_sites_target = (num_wyk_sites_cpu - 1).clamp(0, S - 1).to(device)
 
         targets = {
-            'spg_target':       batch.spg_idx.squeeze(-1),
-            'lattice_target':   batch.wyk_lattice.view(B, 6),
+            'spg_target':       spg_idx_cpu.to(device),
+            'lattice_target':   lattice_cpu.to(device),
             'num_sites_target': num_sites_target,
             'elem_target':      elem_target,
             'letter_target':    letter_target,
@@ -291,6 +368,11 @@ class WyckoffCDVAE(BaseModule):
 
 
     def kld_loss(self, mu, log_var):
+        # clamp log_var 防止 exp() 溢出：
+        #   log_var > 88  → exp(log_var) > 1e38，超出 float32 上限 → +inf
+        #   inf - inf = nan，污染整个 KLD → val_loss=NaN → EarlyStopping 误杀训练
+        # clamp(-10, 2)：exp(2)≈7.4，exp(-10)≈0，覆盖合理的 log_var 范围
+        log_var = log_var.clamp(-10, 2)
         return torch.mean(
             -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1)
         )
@@ -298,22 +380,46 @@ class WyckoffCDVAE(BaseModule):
    
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
-        log_dict = {f'train_{k}': v for k, v in loss_dict.items()}
-        log_dict['train_loss'] = total_loss
+        # ── [临时诊断] 打印前5个batch的完整loss_dict ──
+        if batch_idx < 5:
+            debug_dict = {k: (v.item() if torch.is_tensor(v) else v)
+                          for k, v in loss_dict.items()}
+            if batch_idx == 0:
+                # [CONFIG] 行：确认YAML权重是否正确传入（若total_loss=0.0，看这里）
+                print(f"[CONFIG] beta={self.hparams.beta} "
+                      f"w_spg={self.hparams.w_spg} "
+                      f"w_lattice={self.hparams.w_lattice} "
+                      f"w_elem={self.hparams.w_elem} "
+                      f"w_letter={self.hparams.w_letter} "
+                      f"w_free={self.hparams.w_free} "
+                      f"w_nsites={getattr(self.hparams,'w_nsites',0.5)} "
+                      f"w_overlap={getattr(self.hparams,'w_overlap',1.0)} "
+                      f"overlap_threshold={getattr(self.hparams,'overlap_threshold',0.8)}",
+                      flush=True)
+            print(f"[DEBUG step{batch_idx}] total_loss={total_loss.item():.6f} "
+                  f"loss_dict={debug_dict}", flush=True)
+        # detach带grad_fn的tensor条目(kld_loss/kld_site/property_loss)，
+        # 否则 on_epoch=True 的聚合会保留整张计算图(含_overlap_penalty的
+        # 大CPU中间张量)直到epoch结束，导致CPU内存累积OOM。
+        log_dict = {f'train_{k}': (v.detach() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
+        log_dict['train_loss'] = total_loss.detach()
         self.log_dict(log_dict, on_step=True, on_epoch=True, prog_bar=True)
         return total_loss
 
     def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
-        log_dict = {f'val_{k}': v for k, v in loss_dict.items()}
-        log_dict['val_loss'] = total_loss
+        log_dict = {f'val_{k}': (v.detach() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
+        log_dict['val_loss'] = total_loss.detach()
         self.log_dict(log_dict, on_step=False, on_epoch=True, prog_bar=True)
         return total_loss
 
     def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
-        log_dict = {f'test_{k}': v for k, v in loss_dict.items()}
-        log_dict['test_loss'] = total_loss
+        # 修复：kld_loss/kld_site/property_loss/recon_loss 在test模式下虽无计算图，
+        # 但统一转成Python float与training_step保持一致，避免PL聚合时意外保留tensor。
+        log_dict = {f'test_{k}': (v.item() if torch.is_tensor(v) else v)
+                    for k, v in loss_dict.items()}
+        log_dict['test_loss'] = total_loss.item()
         self.log_dict(log_dict)
         return total_loss
 

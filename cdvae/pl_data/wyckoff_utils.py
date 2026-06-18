@@ -88,12 +88,43 @@ def _unwrap_pymatgen(result):
     return None
 
 
+# ─── 诊断：路径计数 ───
+import collections as _collections
+W2S_PATH_COUNTER = _collections.Counter()
+W2S_ERROR_SAMPLES = _collections.defaultdict(list)
+W2S_BAD_LETTERS = []  # 记录非法 (spg, letter, 错误类型)
+
+def _w2s_log(path, err=None):
+    W2S_PATH_COUNTER[path] += 1
+    if err is not None and len(W2S_ERROR_SAMPLES[path]) < 6:
+        W2S_ERROR_SAMPLES[path].append(f"{type(err).__name__}: {err}")
+
+def w2s_report():
+    print("\n===== wyckoff_to_structure 路径统计 =====")
+    total = sum(v for k,v in W2S_PATH_COUNTER.items() if k in
+                ['尝试1_ops投影手动','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None'])
+    for path in ['尝试1_ops投影手动','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None']:
+        n = W2S_PATH_COUNTER.get(path, 0)
+        print(f"  {path:20s}: {n:4d} ({100*n/total if total else 0:5.1f}%)")
+    print(f"  {'总计':20s}: {total}")
+    for path in ['尝试1_ops投影手动']:
+        if W2S_ERROR_SAMPLES[path]:
+            print(f"\n  [{path}] 整体失败错误样本:")
+            for e in W2S_ERROR_SAMPLES[path]:
+                print(f"    - {e}")
+    if W2S_BAD_LETTERS:
+        print(f"\n  跳过的非法site样本 (spg, letter, 错误): {W2S_BAD_LETTERS[:10]}")
+
+
 def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
                           site_free_params, lattice_params):
     """
-    Wyckoff to pymatgen Structure.
+    Wyckoff -> pymatgen Structure。
+    主路径(尝试1)：用 wp.ops[0].operate() 把预测坐标投影到该letter的Wyckoff位，
+    再用 wp.ops 展开生成对称等价原子，手动构建（尊重letter重数+预测坐标+预测晶格）。
+    失败再降级到 pyxtal build / from_random。
     """
-    crystal = pyxtal()
+    from pymatgen.core import Lattice, Structure
 
     if hasattr(lattice_params, 'cpu'):
         lp = lattice_params.cpu().numpy()
@@ -101,73 +132,117 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
         lp = np.array(lattice_params)
     a, b, c, alpha, beta, gamma = [float(x) for x in lp]
 
-    # 按元素分组，保留 Wyckoff letter
+    g = Group(spacegroup_num)
+
+    # 预处理：每个site的 (elem, letter, 预测坐标)
+    sites_info = []
+    for elem, letter, fp in zip(site_elements, site_letters, site_free_params):
+        fp_arr = fp.cpu().numpy() if hasattr(fp, 'cpu') else np.array(fp)
+        coord = [float(fp_arr[k]) % 1.0 for k in range(3)]
+        sites_info.append((elem, letter, coord))
+
+    # ── 尝试1（核心）：ops[0]投影 + 手动构建（逐site容错）──
+    try:
+        lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma)
+        valid_letters = set(wp.letter for wp in g.Wyckoff_positions)
+        all_sp, all_co = [], []
+        n_skip = 0
+        for elem, letter, coord in sites_info:
+            try:
+                if letter not in valid_letters:
+                    raise KeyError(f"letter {letter} 不在SG{spacegroup_num}")
+                wp = g[letter]
+                rep = wp.ops[0].operate(coord)
+                rep = [float(x) % 1.0 for x in rep]
+                for op in wp.ops:
+                    pos = np.array(op.operate(rep)) % 1.0
+                    all_sp.append(elem)
+                    all_co.append(pos)
+            except Exception as se:
+                n_skip += 1
+                if len(W2S_BAD_LETTERS) < 15:
+                    W2S_BAD_LETTERS.append((spacegroup_num, letter, type(se).__name__))
+                continue
+        # 至少一半site合法才接受（否则结构信息损失太大）
+        if all_sp and n_skip <= len(sites_info) // 2:
+            s = Structure(lattice, all_sp, all_co)
+            s.merge_sites(tol=0.01, mode='delete')
+            ok = True
+            if len(s) > 1:
+                dm = s.distance_matrix.copy()
+                np.fill_diagonal(dm, 999.0)
+                if dm.min() < 0.5:
+                    ok = False
+            if ok and len(s) > 0:
+                _w2s_log('尝试1_ops投影手动')
+                return s
+    except Exception as e:
+        _w2s_log('尝试1_ops投影手动', e)
+
+    # 以下为降级路径（沿用v3的pyxtal方案）
+    from pyxtal.lattice import Lattice as PyxtalLattice
+    ltype = getattr(g, 'lattice_type', 'triclinic')
+
     element_sites = {}
-    for elem, letter in zip(site_elements, site_letters):
+    for elem, letter, coord in sites_info:
         if elem not in element_sites:
             element_sites[elem] = []
-        element_sites[elem].append(letter)
+        try:
+            mult = g[letter].multiplicity
+        except Exception:
+            mult = 1
+        element_sites[elem].append((f"{mult}{letter}", coord, mult))
 
     species = list(element_sites.keys())
-    sites   = [element_sites[e] for e in species]
+    numIons = [sum(m for _, _, m in element_sites[e]) for e in species]
+    sites_coords = [[{lab: crd} for lab, crd, _ in element_sites[e]] for e in species]
 
-    # 计算 numIons
-    g = Group(spacegroup_num)
-    numIons = []
-    for elem_letters in sites:
-        count = 0
-        for letter in elem_letters:
-            try:
-                count += g[letter].multiplicity
-            except Exception:
-                count += 1
-        numIons.append(count)
+    latt = None
+    for try_ltype in [ltype, 'triclinic']:
+        try:
+            latt = PyxtalLattice.from_para(a, b, c, alpha, beta, gamma, ltype=try_ltype)
+            break
+        except Exception:
+            latt = None
+    if latt is None:
+        try:
+            latt = PyxtalLattice.from_para(8.0, 8.0, 8.0, 90, 90, 90, ltype='cubic')
+        except Exception:
+            latt = None
 
-    # 先尝试指定 sites
+    # 尝试2：pyxtal build
+    if latt is not None:
+        try:
+            crystal = pyxtal()
+            crystal.build(g, species, numIons, lattice=latt, sites=sites_coords)
+            result = _unwrap_pymatgen(crystal.to_pymatgen())
+            if result is not None:
+                _w2s_log('尝试2_pyxtal_build')
+                return result
+        except Exception:
+            pass
+
+    # 尝试3：from_random + 预测晶格
+    if latt is not None:
+        try:
+            crystal = pyxtal()
+            crystal.from_random(3, spacegroup_num, species, numIons, lattice=latt)
+            result = _unwrap_pymatgen(crystal.to_pymatgen())
+            if result is not None:
+                _w2s_log('尝试3_random+晶格')
+                return result
+        except Exception:
+            pass
+
+    # 尝试4：全随机
     try:
-        crystal.from_random(
-            3, spacegroup_num, species, numIons,
-            sites=sites,
-            lattice=[a, b, c, alpha, beta, gamma],
-        )
+        crystal = pyxtal()
+        crystal.from_random(3, spacegroup_num, species, numIons)
         result = _unwrap_pymatgen(crystal.to_pymatgen())
-        if result is not None:
-            return result
+        _w2s_log('尝试4_全随机')
+        return result
     except Exception:
         pass
 
-    # fallback: 不指定 sites
-    try:
-        crystal.from_random(
-            3, spacegroup_num, species, numIons,
-            lattice=[a, b, c, alpha, beta, gamma],
-        )
-        return _unwrap_pymatgen(crystal.to_pymatgen())
-    except Exception:
-        pass
-
-    # 最终 fallback: 从 atom_sites 直接构建
-    try:
-        from pymatgen.core import Lattice
-        lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma)
-        sp, coords = [], []
-        for site in crystal.atom_sites:
-            for coord in site.coords:
-                sp.append(site.specie)
-                coords.append(coord)
-        if sp:
-            return Structure(lattice, sp, coords)
-    except Exception as e:
-        print(f'[DEBUG] fallback failed: {e}')
-
-    # 最终 fallback：完全不指定 lattice，让 PyXtal 自由生成
-    try:
-        crystal2 = pyxtal()
-        crystal2.from_random(3, spacegroup_num, species, numIons)
-        result = _unwrap_pymatgen(crystal2.to_pymatgen())
-        if result is not None:
-            return result
-    except Exception:
-        pass
-
+    _w2s_log('返回None')
     return None

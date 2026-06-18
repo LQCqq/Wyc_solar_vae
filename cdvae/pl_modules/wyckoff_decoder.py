@@ -1,19 +1,35 @@
 import numpy as _np
 
 def _fix_lattice(lp):
-    """角度从弧度转为角度制，确保物理合理性"""
-    lp = lp.copy()
-    # 反归一化：训练时loss用了 pred/[10,10,10,90,90,90]，这里还原
-    lp[:3] = lp[:3] * 10.0
-    lp[3:] = lp[3:] * 90.0
-    # 长度：确保正值，合理范围
-    lp[:3] = _np.abs(lp[:3])
-    lp[:3] = _np.clip(lp[:3], 1.0, 30.0)
-    # 角度：如果是弧度制（< π）则转为角度制
-    if _np.all(lp[3:] < _np.pi * 1.1):
-        lp[3:] = _np.degrees(lp[3:])
-    lp[3:] = _np.clip(lp[3:], 30.0, 150.0)
-    return lp
+    """反归一化 + 保证几何合法。
+    模型输出：长度=原始Å（~6），角度=弧度（90°≈1.571）。
+    修复：长度不再×10，角度用degrees()而非×90，并强制晶胞体积为正。
+    """
+    lp = lp.copy().astype(float)
+
+    # ── 长度：模型直接输出Å，不再 ×10 ──
+    lengths = _np.abs(lp[:3])
+    lengths = _np.clip(lengths, 2.0, 30.0)
+
+    # ── 角度：模型输出弧度，转角度（不再 ×90）──
+    angles = _np.asarray(lp[3:], dtype=float)
+    # 若处于弧度范围(|θ|<2π+裕度)则转角度
+    if _np.all(_np.abs(angles) < 2.0 * _np.pi + 0.5):
+        angles = _np.degrees(angles)
+    angles = _np.abs(angles)
+    angles = _np.clip(angles, 30.0, 150.0)
+
+    # ── 几何合法性：度量张量正定(体积因子>0)，否则向90°收缩 ──
+    for _ in range(20):
+        ca, cb, cg = _np.cos(_np.radians(angles))
+        vol = 1.0 + 2.0 * ca * cb * cg - ca * ca - cb * cb - cg * cg
+        if vol > 0.05:
+            break
+        angles = 90.0 + (angles - 90.0) * 0.8
+    else:
+        angles = _np.array([90.0, 90.0, 90.0])
+
+    return _np.concatenate([lengths, angles])
 
 # models/wyckoff_decoder.py
 import torch
@@ -95,7 +111,14 @@ class WyckoffDecoder(nn.Module):
             nn.Linear(hidden_dim, num_elements),
         )
         self.letter_head = nn.Linear(hidden_dim, num_wyckoff_letters)
-        self.free_param_head = nn.Linear(hidden_dim, 3)
+        # ── 改动1：free_param_head 从单层线性改为3层MLP，提升自由参数预测能力 ──
+        self.free_param_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 4, 3),
+        )
 
         # diffusion时间步embedding
         self.T = 100
@@ -111,12 +134,24 @@ class WyckoffDecoder(nn.Module):
         self.noisy_letter_emb = nn.Embedding(num_wyckoff_letters + 1, hidden_dim // 4)
         self.noisy_letter_proj = nn.Linear(hidden_dim // 4, hidden_dim)
 
-        # cross-attention：decoder site特征attend到encoder per-site特征
+        self.hidden_dim = hidden_dim
+        # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用，无shortcut）
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_norm = nn.LayerNorm(hidden_dim)
 
+        # ── 改动2：site_z_projector — 从全局z派生per-site z ──
+        # 生成时不再用纯随机噪声N(0,I)，而是用全局z的投影 + 小噪声(σ=0.2)
+        # 训练时通过model.py中的scheduled sampling训练此projector
+        self.site_z_projector = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
 
-    def forward(self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None, enc_site_feats=None, enc_padding_mask=None):
+
+    def forward(self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None, per_site_z=None, enc_padding_mask=None):
         """
         z: (B, latent_dim)
         Returns dict of predictions (logits)
@@ -160,10 +195,10 @@ class WyckoffDecoder(nn.Module):
             site_feats = site_feats + noisy_letter_feats
         site_feats = self.site_fusion(site_feats)
 
-        # cross-attention：decoder site特征attend到encoder per-site特征
-        if enc_site_feats is not None:
+        # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用）
+        if per_site_z is not None:
             ca_out, _ = self.cross_attn(
-                site_feats, enc_site_feats, enc_site_feats,
+                site_feats, per_site_z, per_site_z,
                 key_padding_mask=enc_padding_mask
             )
             site_feats = self.cross_attn_norm(site_feats + ca_out)
@@ -210,6 +245,13 @@ class WyckoffDecoder(nn.Module):
             for b in range(B)
         ])  # (B, num_letters)
 
+        # ── 改动3：per_site_z 从全局z派生，不再是纯N(0,I)噪声 ──
+        # 原来：per_site_z = torch.randn(B, self.max_sites, self.hidden_dim, device=device)
+        # 现在：site_z_projector(z) + 小噪声(σ=0.2)，携带全局晶体化学信息
+        z_proj = self.site_z_projector(z)                           # (B, hidden_dim)
+        z_proj = z_proj.unsqueeze(1).expand(B, self.max_sites, -1)  # (B, max_sites, D)
+        per_site_z = z_proj + torch.randn_like(z_proj) * 0.2       # 小噪声保持多样性
+
         # 真正的diffusion生成：从全MASK开始，迭代去噪（elem和letter同步）
         noisy_elem_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
         noisy_letter_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
@@ -217,7 +259,7 @@ class WyckoffDecoder(nn.Module):
         # 迭代去噪：t从T到1
         for step in range(self.T, 0, -1):
             t = torch.full((B,), step, dtype=torch.long, device=device)
-            preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids)
+            preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z)
 
             # 对所有位点采样元素（向量化）
             elem_probs = torch.softmax(preds['elem_logits'] / temperature, dim=-1)  # (B, S, 100)
@@ -247,11 +289,13 @@ class WyckoffDecoder(nn.Module):
 
         # 最终一步：用t=1做最终预测
         t_final = torch.ones(B, dtype=torch.long, device=device)
-        preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids)
+        preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z)
 
         results = []
         for i in range(B):
-            spg_num = preds['spg_logits'][i].argmax().item() + 1
+            # 用与 letter mask 一致的 spg（spg_nums，初始预测），
+            # 避免 t=1 重新argmax得到不同spg，导致letter与空间群不匹配
+            spg_num = int(spg_nums[i].item())
             n_sites = preds['num_sites_logits'][i].argmax().item() + 1
 
             elements = []
