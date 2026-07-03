@@ -1,17 +1,13 @@
 import numpy as _np
 
 def _fix_lattice(lp):
-    """反归一化 + 保证几何合法。
-    模型输出：长度=原始Å（~6），角度=弧度（90°≈1.571）。
-    修复：长度不再×10，角度用degrees()而非×90，并强制晶胞体积为正。
+    """归一化
     """
     lp = lp.copy().astype(float)
 
-    # ── 长度：模型直接输出Å，不再 ×10 ──
     lengths = _np.abs(lp[:3])
     lengths = _np.clip(lengths, 2.0, 30.0)
 
-    # ── 角度：模型输出弧度，转角度（不再 ×90）──
     angles = _np.asarray(lp[3:], dtype=float)
     # 若处于弧度范围(|θ|<2π+裕度)则转角度
     if _np.all(_np.abs(angles) < 2.0 * _np.pi + 0.5):
@@ -19,7 +15,6 @@ def _fix_lattice(lp):
     angles = _np.abs(angles)
     angles = _np.clip(angles, 30.0, 150.0)
 
-    # ── 几何合法性：度量张量正定(体积因子>0)，否则向90°收缩 ──
     for _ in range(20):
         ca, cb, cg = _np.cos(_np.radians(angles))
         vol = 1.0 + 2.0 * ca * cb * cg - ca * ca - cb * cb - cg * cg
@@ -31,7 +26,6 @@ def _fix_lattice(lp):
 
     return _np.concatenate([lengths, angles])
 
-# models/wyckoff_decoder.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -85,7 +79,7 @@ class WyckoffDecoder(nn.Module):
         )
         
         
-        # 并行解码：预测 max_sites 个位点，用 mask 截断
+        # 预测 max_sites 个位点
         self.site_decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -111,7 +105,7 @@ class WyckoffDecoder(nn.Module):
             nn.Linear(hidden_dim, num_elements),
         )
         self.letter_head = nn.Linear(hidden_dim, num_wyckoff_letters)
-        # ── 改动1：free_param_head 从单层线性改为3层MLP，提升自由参数预测能力 ──
+        # free_param_head 3层MLP
         self.free_param_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
@@ -124,7 +118,6 @@ class WyckoffDecoder(nn.Module):
         self.T = 100
         self.time_emb = nn.Embedding(self.T + 1, hidden_dim)
 
-        # 真正的diffusion：decoder接收noisy元素作为条件输入
         # index 0 = MASK token，index 1-100 = 实际元素
         self.noisy_elem_emb = nn.Embedding(num_elements + 1, hidden_dim // 4)
         self.noisy_elem_proj = nn.Linear(hidden_dim // 4, hidden_dim)
@@ -135,13 +128,11 @@ class WyckoffDecoder(nn.Module):
         self.noisy_letter_proj = nn.Linear(hidden_dim // 4, hidden_dim)
 
         self.hidden_dim = hidden_dim
-        # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用，无shortcut）
+        # cross-attention：decoder site特征attend到per-site latent z
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_norm = nn.LayerNorm(hidden_dim)
 
-        # ── 改动2：site_z_projector — 从全局z派生per-site z ──
-        # 生成时不再用纯随机噪声N(0,I)，而是用全局z的投影 + 小噪声(σ=0.2)
-        # 训练时通过model.py中的scheduled sampling训练此projector
+        # site_z_projector 从全局z派生per-site z
         self.site_z_projector = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -183,12 +174,12 @@ class WyckoffDecoder(nn.Module):
                 
         pos = self.site_pos_emb.weight
         site_feats = site_h.unsqueeze(1) + pos.unsqueeze(0)
-        # 加入noisy元素条件（真正的diffusion去噪信号）
+        # 加入noisy elem
         if noisy_elem_ids is not None:
             noisy_feats = self.noisy_elem_emb(noisy_elem_ids)     # (B, max_sites, D/4)
             noisy_feats = self.noisy_elem_proj(noisy_feats)        # (B, max_sites, D)
             site_feats = site_feats + noisy_feats
-        # 加入noisy letter条件（letter diffusion去噪信号）
+        # 加入noisy letter
         if noisy_letter_ids is not None:
             noisy_letter_feats = self.noisy_letter_emb(noisy_letter_ids)    # (B, max_sites, D/4)
             noisy_letter_feats = self.noisy_letter_proj(noisy_letter_feats)  # (B, max_sites, D)
@@ -221,7 +212,7 @@ class WyckoffDecoder(nn.Module):
         B = z.shape[0]
         device = z.device
 
-        # 预测SPG（固定用于letter约束，避免每步重复查询）
+        # 预测SPG
         h_init = self.fc_shared(z)
         spg_logits_init = self.spg_head(h_init)
         spg_nums = spg_logits_init.argmax(-1) + 1  # (B,) 1-indexed
@@ -245,23 +236,21 @@ class WyckoffDecoder(nn.Module):
             for b in range(B)
         ])  # (B, num_letters)
 
-        # ── 改动3：per_site_z 从全局z派生，不再是纯N(0,I)噪声 ──
-        # 原来：per_site_z = torch.randn(B, self.max_sites, self.hidden_dim, device=device)
-        # 现在：site_z_projector(z) + 小噪声(σ=0.2)，携带全局晶体化学信息
+        
+        # site_z_projector(z)，携带全局晶体化学信息
         z_proj = self.site_z_projector(z)                           # (B, hidden_dim)
         z_proj = z_proj.unsqueeze(1).expand(B, self.max_sites, -1)  # (B, max_sites, D)
         per_site_z = z_proj + torch.randn_like(z_proj) * 0.2       # 小噪声保持多样性
 
-        # 真正的diffusion生成：从全MASK开始，迭代去噪（elem和letter同步）
         noisy_elem_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
         noisy_letter_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
 
-        # 迭代去噪：t从T到1
+        # 去噪：从T到1
         for step in range(self.T, 0, -1):
             t = torch.full((B,), step, dtype=torch.long, device=device)
             preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z)
 
-            # 对所有位点采样元素（向量化）
+            # 对所有位点采样elem
             elem_probs = torch.softmax(preds['elem_logits'] / temperature, dim=-1)  # (B, S, 100)
             B_, S_, V_ = elem_probs.shape
             sampled_elems = torch.multinomial(
@@ -277,24 +266,22 @@ class WyckoffDecoder(nn.Module):
                 letter_probs.view(-1, L_), 1
             ).view(B_, S_) + 1  # 1-indexed letter ID
 
-            # 按当前步概率决定unmask：每步期望unmask 1/step比例
             unmask_prob = 1.0 / step
             should_unmask = torch.rand(B, self.max_sites, device=device) < unmask_prob
 
-            # 只更新仍是MASK(0)的位点（elem和letter同步unmask）
+    
             still_masked = (noisy_elem_ids == 0)
             update = still_masked & should_unmask
             noisy_elem_ids = torch.where(update, sampled_elems, noisy_elem_ids)
             noisy_letter_ids = torch.where(update, sampled_letters, noisy_letter_ids)
 
-        # 最终一步：用t=1做最终预测
+    
         t_final = torch.ones(B, dtype=torch.long, device=device)
         preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z)
 
         results = []
         for i in range(B):
-            # 用与 letter mask 一致的 spg（spg_nums，初始预测），
-            # 避免 t=1 重新argmax得到不同spg，导致letter与空间群不匹配
+            # 用与 letter mask 一致的 spg（spg_nums，初始预测, 避免 t=1 重新argmax得到不同spg，导致letter与空间群不匹配
             spg_num = int(spg_nums[i].item())
             n_sites = preds['num_sites_logits'][i].argmax().item() + 1
 
@@ -302,11 +289,11 @@ class WyckoffDecoder(nn.Module):
             letters = []
             free_params = []
             for s in range(n_sites):
-                # 优先使用去噪后的元素ID，仍为MASK则用logits
+        
                 elem_z = noisy_elem_ids[i, s].item()
                 if elem_z == 0:
                     elem_z = preds['elem_logits'][i, s].argmax().item() + 1
-                # 优先使用去噪后的letter ID，仍为MASK则用logits
+                # 用去噪后的letter ID
                 letter_idx = noisy_letter_ids[i, s].item() - 1  # 转为0-indexed
                 if noisy_letter_ids[i, s].item() == 0:
                     letter_idx = preds['letter_logits'][i, s].argmax().item()

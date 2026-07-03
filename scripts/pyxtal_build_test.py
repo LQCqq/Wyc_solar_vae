@@ -1,8 +1,5 @@
 """
-诊断 overlap penalty 是否导致 repeats/索引错误。强制 CPU 运行，
-CPU 上的越界索引会同步报错且信息准确（不像 CUDA 异步会错位到 encoder）。
-
-用法（PBS）：python diag_penalty.py
+看 overlap penalty 是否导致 repeats/索引错误。强制 CPU 运行，
 """
 import os
 import torch

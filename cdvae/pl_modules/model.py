@@ -161,9 +161,6 @@ class WyckoffCDVAE(BaseModule):
             w_elem=self.hparams.w_elem,
             w_letter=self.hparams.w_letter,
             w_free=self.hparams.w_free,
-            w_nsites=getattr(self.hparams, 'w_nsites', 0.5),
-            w_overlap=getattr(self.hparams, 'w_overlap', 1.0),
-            overlap_threshold=getattr(self.hparams, 'overlap_threshold', 0.8),
         )
 
         # diffusion步数
@@ -277,7 +274,6 @@ class WyckoffCDVAE(BaseModule):
             'kld_loss': kld_loss,
             'kld_site': kld_site,
             'property_loss': property_loss,
-            'recon_loss': recon_loss.detach(),  # 诊断用：确认recon项是否进入total_loss
         })
         return total_loss, loss_dict
 
@@ -368,11 +364,6 @@ class WyckoffCDVAE(BaseModule):
 
 
     def kld_loss(self, mu, log_var):
-        # clamp log_var 防止 exp() 溢出：
-        #   log_var > 88  → exp(log_var) > 1e38，超出 float32 上限 → +inf
-        #   inf - inf = nan，污染整个 KLD → val_loss=NaN → EarlyStopping 误杀训练
-        # clamp(-10, 2)：exp(2)≈7.4，exp(-10)≈0，覆盖合理的 log_var 范围
-        log_var = log_var.clamp(-10, 2)
         return torch.mean(
             -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1)
         )
@@ -380,26 +371,20 @@ class WyckoffCDVAE(BaseModule):
    
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
-        # ── [临时诊断] 打印前5个batch的完整loss_dict ──
+        # ── [临时诊断] 打印前5个batch的完整loss_dict，定位nan第一次出现 ──
+        # 注意: loss_dict里的大部分项已经是.item()过的Python float
+        # (见WyckoffReconLoss.forward的return)，但kld_loss/kld_site/
+        # property_loss是forward()第274-278行后加进去的、带grad_fn的
+        # GPU tensor。直接对它们做repr()(f-string会调用)在本机
+        # H200/sm_90上会触发torch._tensor_str的masked_select整数溢出
+        # bug(RuntimeError: numel: integer multiplication overflow)，
+        # 与loss本身是否nan无关。这里统一转成Python标量再打印。
         if batch_idx < 5:
-            debug_dict = {k: (v.item() if torch.is_tensor(v) else v)
-                          for k, v in loss_dict.items()}
-            if batch_idx == 0:
-                # [CONFIG] 行：确认YAML权重是否正确传入（若total_loss=0.0，看这里）
-                print(f"[CONFIG] beta={self.hparams.beta} "
-                      f"w_spg={self.hparams.w_spg} "
-                      f"w_lattice={self.hparams.w_lattice} "
-                      f"w_elem={self.hparams.w_elem} "
-                      f"w_letter={self.hparams.w_letter} "
-                      f"w_free={self.hparams.w_free} "
-                      f"w_nsites={getattr(self.hparams,'w_nsites',0.5)} "
-                      f"w_overlap={getattr(self.hparams,'w_overlap',1.0)} "
-                      f"overlap_threshold={getattr(self.hparams,'overlap_threshold',0.8)}",
-                      flush=True)
-            print(f"[DEBUG step{batch_idx}] total_loss={total_loss.item():.6f} "
+            debug_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
+            print(f"[DEBUG step{batch_idx}] total_loss={total_loss.item()} "
                   f"loss_dict={debug_dict}", flush=True)
         # detach带grad_fn的tensor条目(kld_loss/kld_site/property_loss)，
-        # 否则 on_epoch=True 的聚合会保留整张计算图(含_overlap_penalty的
+        # 否则 on_epoch=True 的聚合会保留整张计算图，
         # 大CPU中间张量)直到epoch结束，导致CPU内存累积OOM。
         log_dict = {f'train_{k}': (v.detach() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
         log_dict['train_loss'] = total_loss.detach()
@@ -415,11 +400,8 @@ class WyckoffCDVAE(BaseModule):
 
     def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
-        # 修复：kld_loss/kld_site/property_loss/recon_loss 在test模式下虽无计算图，
-        # 但统一转成Python float与training_step保持一致，避免PL聚合时意外保留tensor。
-        log_dict = {f'test_{k}': (v.item() if torch.is_tensor(v) else v)
-                    for k, v in loss_dict.items()}
-        log_dict['test_loss'] = total_loss.item()
+        log_dict = {f'test_{k}': v for k, v in loss_dict.items()}
+        log_dict['test_loss'] = total_loss
         self.log_dict(log_dict)
         return total_loss
 

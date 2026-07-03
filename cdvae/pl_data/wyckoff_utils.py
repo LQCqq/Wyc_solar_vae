@@ -78,7 +78,7 @@ def encode_wyckoff_tensors(wyckoff_dict):
 
 
 def _unwrap_pymatgen(result):
-    """递归展开嵌套 list，直到得到 Structure 或 None"""
+
     while isinstance(result, list):
         if len(result) == 0:
             return None
@@ -88,7 +88,6 @@ def _unwrap_pymatgen(result):
     return None
 
 
-# ─── 诊断：路径计数 ───
 import collections as _collections
 W2S_PATH_COUNTER = _collections.Counter()
 W2S_ERROR_SAMPLES = _collections.defaultdict(list)
@@ -102,8 +101,8 @@ def _w2s_log(path, err=None):
 def w2s_report():
     print("\n===== wyckoff_to_structure 路径统计 =====")
     total = sum(v for k,v in W2S_PATH_COUNTER.items() if k in
-                ['尝试1_ops投影手动','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None'])
-    for path in ['尝试1_ops投影手动','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None']:
+                ['尝试1_ops投影','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None'])
+    for path in ['尝试1_ops投影','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None']:
         n = W2S_PATH_COUNTER.get(path, 0)
         print(f"  {path:20s}: {n:4d} ({100*n/total if total else 0:5.1f}%)")
     print(f"  {'总计':20s}: {total}")
@@ -118,12 +117,7 @@ def w2s_report():
 
 def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
                           site_free_params, lattice_params):
-    """
-    Wyckoff -> pymatgen Structure。
-    主路径(尝试1)：用 wp.ops[0].operate() 把预测坐标投影到该letter的Wyckoff位，
-    再用 wp.ops 展开生成对称等价原子，手动构建（尊重letter重数+预测坐标+预测晶格）。
-    失败再降级到 pyxtal build / from_random。
-    """
+  
     from pymatgen.core import Lattice, Structure
 
     if hasattr(lattice_params, 'cpu'):
@@ -141,7 +135,7 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
         coord = [float(fp_arr[k]) % 1.0 for k in range(3)]
         sites_info.append((elem, letter, coord))
 
-    # ── 尝试1（核心）：ops[0]投影 + 手动构建（逐site容错）──
+    # 尝试1：ops[0]投影 
     try:
         lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma)
         valid_letters = set(wp.letter for wp in g.Wyckoff_positions)
@@ -163,23 +157,26 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
                 if len(W2S_BAD_LETTERS) < 15:
                     W2S_BAD_LETTERS.append((spacegroup_num, letter, type(se).__name__))
                 continue
-        # 至少一半site合法才接受（否则结构信息损失太大）
+        
         if all_sp and n_skip <= len(sites_info) // 2:
             s = Structure(lattice, all_sp, all_co)
             s.merge_sites(tol=0.01, mode='delete')
-            ok = True
-            if len(s) > 1:
-                dm = s.distance_matrix.copy()
-                np.fill_diagonal(dm, 999.0)
-                if dm.min() < 0.5:
-                    ok = False
-            if ok and len(s) > 0:
+            #ok = True
+            #if len(s) > 1:
+            #    dm = s.distance_matrix.copy()
+            #    np.fill_diagonal(dm, 999.0)
+            #    if dm.min() < 0.5:
+            #        ok = False
+            #if ok and len(s) > 0:
+            #    _w2s_log('尝试1_ops投影手动')
+            #    return s
+            if len(s) > 0:
                 _w2s_log('尝试1_ops投影手动')
                 return s
     except Exception as e:
         _w2s_log('尝试1_ops投影手动', e)
 
-    # 以下为降级路径（沿用v3的pyxtal方案）
+    # pyxtal
     from pyxtal.lattice import Lattice as PyxtalLattice
     ltype = getattr(g, 'lattice_type', 'triclinic')
 
@@ -244,5 +241,5 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
     except Exception:
         pass
 
-    _w2s_log('返回None')
+    _w2s_log('None')
     return None

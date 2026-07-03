@@ -6,27 +6,22 @@ from pymatgen.io.cif import CifWriter
 
 sys.path.insert(0, '/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae')
 
-# 强制清除 pyc 缓存
 import importlib, pathlib
 for pyc in pathlib.Path('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae').rglob('*.pyc'):
     pyc.unlink()
 os.chdir('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae')
 
-CKPT = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-06-12/test_wyckoff/epoch=159-step=16959.ckpt'
+CKPT = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-06-27/test_wyckoff/epoch=144-step=15369.ckpt'
 NUM_SAMPLES = 2500
 OUT_DIR = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures'
-
-os.makedirs(OUT_DIR, exist_ok=True)
 
 from cdvae.pl_modules.model import WyckoffCDVAE
 
 print('加载模型...')
-model = WyckoffCDVAE.load_from_checkpoint(CKPT)
+model = WyckoffCDVAE.load_from_checkpoint(CKPT, map_location='cpu')
 model.eval()
-# 强制 CPU（避免 H200 sm_90 兼容性问题）
-print('使用 CPU')
+print(f'使用 CPU 生成 {NUM_SAMPLES} 个结构...')
 
-print(f'生成 {NUM_SAMPLES} 个结构...')
 structures = model.generate(num_samples=NUM_SAMPLES)
 
 valid = [(i, s) for i, s in enumerate(structures) if s is not None]

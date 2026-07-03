@@ -86,13 +86,12 @@ class WyckoffEmbedding(nn.Module):
         site_feat = self.site_mlp(site_feat)
         B = data.num_wyk_sites.shape[0]
         device = data.wyk_atom_types.device
-        # nan_to_num+clamp+.long()这条链在本机(H200/sm_90)GPU上不稳定，会产出垃圾值
-        # (曾表现为负数或全0)，连带repeat_interleave"合法地"算错。整条链+repeat_interleave
-        # 全部放CPU算(超小张量，几乎零成本)，结果再.to(device)。
         num_sites_safe = data.num_wyk_sites.cpu().view(-1).nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(0, 100).long()
+        # repeat_interleave在本机(H200/sm_90, PyTorch不兼容)的CUDA kernel不稳定，会非确定性抛
+        # "repeats can not be negative"。强制在CPU上算(超小张量，几乎零成本)，结果再.to(device)。
         wyk_batch = torch.repeat_interleave(
             torch.arange(B, device='cpu'),
-            num_sites_safe
+            num_sites_safe.cpu()
         ).to(device)
         # 填充为(B, max_sites, D)，用于SAB和per-site latent
         padded = torch.zeros(B, self.max_sites, self.hidden_dim, device=device)

@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#PBS -N Unit_Test
+#PBS -N test_repeatsError
 
-#PBS -l select=1:ncpus=2:mem=8gb:ngpus=1
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
 
-#PBS -l walltime=1:00:00
+#PBS -l walltime=12:00:00
 
 #PBS -M z5561341@ad.unsw.edu.au
 
@@ -12,7 +12,15 @@
 
 #PBS -j oe
 
-cd /srv/scratch/z5561341/projectA/cdvae/scripts
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts
 source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae
-WANDB_API_KEY="" WANDB_MODE=disabled python wyckoff_test.py
+
+
+export PROJECT_ROOT=/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae
+export HYDRA_FULL_ERROR=1
+export PYTHONUNBUFFERED=1
+export CUDA_VISIBLE_DEVICES=""   # 强制CPU，避免CUDA异步错误掩盖真凶
+# -u 强制无缓冲；同时 tee 一份到独立日志，双保险
+python -u pyxtal_build_test.py 2>&1 | tee diag_numsites_log.txt
+echo "=== exit code: ${PIPESTATUS[0]} ==="

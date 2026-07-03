@@ -1,7 +1,3 @@
-"""
-诊断 pyxtal sites 参数格式 + 验证坐标是否真正被使用。
-在 cdvae 环境运行：python test_pyxtal_sites.py
-"""
 import numpy as np
 from pyxtal import pyxtal
 from pyxtal.symmetry import Group
