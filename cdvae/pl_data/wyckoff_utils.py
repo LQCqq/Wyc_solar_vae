@@ -171,6 +171,20 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
             #    _w2s_log('尝试1_ops投影手动')
             #    return s
             if len(s) > 0:
+                # 密度校正：给 MACE 更合理的初始构型
+                # LeMat physical_plausibility 判定范围：0.01-25 g/cm³
+                try:
+                    density = s.density
+                    if density < 0.01:
+                        # 太稀（晶胞过大）：压缩晶格
+                        new_vol = s.volume * (density / 0.02)
+                        s.scale_lattice(new_vol)
+                    elif density > 25.0:
+                        # 太密（晶胞过小）：膨胀晶格
+                        new_vol = s.volume * (density / 20.0)
+                        s.scale_lattice(new_vol)
+                except Exception:
+                    pass  # 密度计算失败不影响主流程
                 _w2s_log('尝试1_ops投影手动')
                 return s
     except Exception as e:

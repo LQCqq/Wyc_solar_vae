@@ -1,19 +1,24 @@
 import numpy as _np
 
-def _fix_lattice(lp):
-    """归一化
+def _fix_lattice(lp, n_atoms=1):
+    """晶格参数后处理：
+    - 长度：根据原子数动态设定下限，防止晶胞过小导致密度过高
+    - 角度：收紧到 [45, 135] 覆盖常见晶系
+    - 体积正定性检查：确保晶格矩阵行列式 > 0
     """
     lp = lp.copy().astype(float)
 
     lengths = _np.abs(lp[:3])
-    lengths = _np.clip(lengths, 2.0, 30.0)
+    # 根据原子数动态最小长度：n个原子至少需要约 n^(1/3) × 1.8Å
+    min_len = max(2.5, float(n_atoms) ** (1.0 / 3.0) * 1.8)
+    lengths = _np.clip(lengths, min_len, 15.0)
 
     angles = _np.asarray(lp[3:], dtype=float)
     # 若处于弧度范围(|θ|<2π+裕度)则转角度
     if _np.all(_np.abs(angles) < 2.0 * _np.pi + 0.5):
         angles = _np.degrees(angles)
     angles = _np.abs(angles)
-    angles = _np.clip(angles, 30.0, 150.0)
+    angles = _np.clip(angles, 45.0, 135.0)  # 收紧：覆盖立方/四方/六方/单斜常见范围
 
     for _ in range(20):
         ca, cb, cg = _np.cos(_np.radians(angles))
@@ -312,12 +317,24 @@ class WyckoffDecoder(nn.Module):
                 letters.append(letter)
                 free_params.append(fp)
 
+            # 计算展开后的总原子数，用于 _fix_lattice 的动态长度下限
+            try:
+                from pyxtal.symmetry import Group as _Group
+                _g = _Group(spg_num)
+                _valid_letters = {wp.letter for wp in _g.Wyckoff_positions}
+                _n_atoms = sum(
+                    _g[lt].multiplicity if lt in _valid_letters else 1
+                    for lt in letters
+                )
+            except Exception:
+                _n_atoms = n_sites * 2
+
             results.append({
                 'spacegroup_num': spg_num,
                 'site_elements': elements,
                 'site_letters': letters,
                 'site_free_params': free_params,
-                'lattice_params': _fix_lattice(preds['lattice_pred'][i].cpu().numpy()),
+                'lattice_params': _fix_lattice(preds['lattice_pred'][i].cpu().numpy(), n_atoms=_n_atoms),
                 'num_sites': n_sites,
             })
         return results
