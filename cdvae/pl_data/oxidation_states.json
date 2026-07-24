@@ -1,0 +1,402 @@
+{
+  "1": {
+    "symbol": "H",
+    "common_oxi": 1
+  },
+  "2": {
+    "symbol": "He",
+    "common_oxi": 0
+  },
+  "3": {
+    "symbol": "Li",
+    "common_oxi": 1
+  },
+  "4": {
+    "symbol": "Be",
+    "common_oxi": 2
+  },
+  "5": {
+    "symbol": "B",
+    "common_oxi": 3
+  },
+  "6": {
+    "symbol": "C",
+    "common_oxi": 4
+  },
+  "7": {
+    "symbol": "N",
+    "common_oxi": -3
+  },
+  "8": {
+    "symbol": "O",
+    "common_oxi": -2
+  },
+  "9": {
+    "symbol": "F",
+    "common_oxi": -1
+  },
+  "10": {
+    "symbol": "Ne",
+    "common_oxi": 0
+  },
+  "11": {
+    "symbol": "Na",
+    "common_oxi": 1
+  },
+  "12": {
+    "symbol": "Mg",
+    "common_oxi": 2
+  },
+  "13": {
+    "symbol": "Al",
+    "common_oxi": 3
+  },
+  "14": {
+    "symbol": "Si",
+    "common_oxi": -4
+  },
+  "15": {
+    "symbol": "P",
+    "common_oxi": 5
+  },
+  "16": {
+    "symbol": "S",
+    "common_oxi": -2
+  },
+  "17": {
+    "symbol": "Cl",
+    "common_oxi": -1
+  },
+  "18": {
+    "symbol": "Ar",
+    "common_oxi": 0
+  },
+  "19": {
+    "symbol": "K",
+    "common_oxi": 1
+  },
+  "20": {
+    "symbol": "Ca",
+    "common_oxi": 2
+  },
+  "21": {
+    "symbol": "Sc",
+    "common_oxi": 3
+  },
+  "22": {
+    "symbol": "Ti",
+    "common_oxi": 4
+  },
+  "23": {
+    "symbol": "V",
+    "common_oxi": 5
+  },
+  "24": {
+    "symbol": "Cr",
+    "common_oxi": 3
+  },
+  "25": {
+    "symbol": "Mn",
+    "common_oxi": 2
+  },
+  "26": {
+    "symbol": "Fe",
+    "common_oxi": 2
+  },
+  "27": {
+    "symbol": "Co",
+    "common_oxi": 2
+  },
+  "28": {
+    "symbol": "Ni",
+    "common_oxi": 2
+  },
+  "29": {
+    "symbol": "Cu",
+    "common_oxi": 2
+  },
+  "30": {
+    "symbol": "Zn",
+    "common_oxi": 2
+  },
+  "31": {
+    "symbol": "Ga",
+    "common_oxi": 3
+  },
+  "32": {
+    "symbol": "Ge",
+    "common_oxi": -4
+  },
+  "33": {
+    "symbol": "As",
+    "common_oxi": -3
+  },
+  "34": {
+    "symbol": "Se",
+    "common_oxi": -2
+  },
+  "35": {
+    "symbol": "Br",
+    "common_oxi": -1
+  },
+  "36": {
+    "symbol": "Kr",
+    "common_oxi": 2
+  },
+  "37": {
+    "symbol": "Rb",
+    "common_oxi": 1
+  },
+  "38": {
+    "symbol": "Sr",
+    "common_oxi": 2
+  },
+  "39": {
+    "symbol": "Y",
+    "common_oxi": 3
+  },
+  "40": {
+    "symbol": "Zr",
+    "common_oxi": 4
+  },
+  "41": {
+    "symbol": "Nb",
+    "common_oxi": 5
+  },
+  "42": {
+    "symbol": "Mo",
+    "common_oxi": 4
+  },
+  "43": {
+    "symbol": "Tc",
+    "common_oxi": 4
+  },
+  "44": {
+    "symbol": "Ru",
+    "common_oxi": 3
+  },
+  "45": {
+    "symbol": "Rh",
+    "common_oxi": 3
+  },
+  "46": {
+    "symbol": "Pd",
+    "common_oxi": 2
+  },
+  "47": {
+    "symbol": "Ag",
+    "common_oxi": 1
+  },
+  "48": {
+    "symbol": "Cd",
+    "common_oxi": 2
+  },
+  "49": {
+    "symbol": "In",
+    "common_oxi": 3
+  },
+  "50": {
+    "symbol": "Sn",
+    "common_oxi": -4
+  },
+  "51": {
+    "symbol": "Sb",
+    "common_oxi": -3
+  },
+  "52": {
+    "symbol": "Te",
+    "common_oxi": -2
+  },
+  "53": {
+    "symbol": "I",
+    "common_oxi": -1
+  },
+  "54": {
+    "symbol": "Xe",
+    "common_oxi": 2
+  },
+  "55": {
+    "symbol": "Cs",
+    "common_oxi": 1
+  },
+  "56": {
+    "symbol": "Ba",
+    "common_oxi": 2
+  },
+  "57": {
+    "symbol": "La",
+    "common_oxi": 3
+  },
+  "58": {
+    "symbol": "Ce",
+    "common_oxi": 3
+  },
+  "59": {
+    "symbol": "Pr",
+    "common_oxi": 3
+  },
+  "60": {
+    "symbol": "Nd",
+    "common_oxi": 3
+  },
+  "61": {
+    "symbol": "Pm",
+    "common_oxi": 3
+  },
+  "62": {
+    "symbol": "Sm",
+    "common_oxi": 3
+  },
+  "63": {
+    "symbol": "Eu",
+    "common_oxi": 2
+  },
+  "64": {
+    "symbol": "Gd",
+    "common_oxi": 3
+  },
+  "65": {
+    "symbol": "Tb",
+    "common_oxi": 3
+  },
+  "66": {
+    "symbol": "Dy",
+    "common_oxi": 3
+  },
+  "67": {
+    "symbol": "Ho",
+    "common_oxi": 3
+  },
+  "68": {
+    "symbol": "Er",
+    "common_oxi": 3
+  },
+  "69": {
+    "symbol": "Tm",
+    "common_oxi": 3
+  },
+  "70": {
+    "symbol": "Yb",
+    "common_oxi": 3
+  },
+  "71": {
+    "symbol": "Lu",
+    "common_oxi": 3
+  },
+  "72": {
+    "symbol": "Hf",
+    "common_oxi": 4
+  },
+  "73": {
+    "symbol": "Ta",
+    "common_oxi": 5
+  },
+  "74": {
+    "symbol": "W",
+    "common_oxi": 4
+  },
+  "75": {
+    "symbol": "Re",
+    "common_oxi": 4
+  },
+  "76": {
+    "symbol": "Os",
+    "common_oxi": 4
+  },
+  "77": {
+    "symbol": "Ir",
+    "common_oxi": 3
+  },
+  "78": {
+    "symbol": "Pt",
+    "common_oxi": 2
+  },
+  "79": {
+    "symbol": "Au",
+    "common_oxi": 3
+  },
+  "80": {
+    "symbol": "Hg",
+    "common_oxi": 1
+  },
+  "81": {
+    "symbol": "Tl",
+    "common_oxi": 1
+  },
+  "82": {
+    "symbol": "Pb",
+    "common_oxi": 2
+  },
+  "83": {
+    "symbol": "Bi",
+    "common_oxi": 3
+  },
+  "84": {
+    "symbol": "Po",
+    "common_oxi": -2
+  },
+  "85": {
+    "symbol": "At",
+    "common_oxi": -1
+  },
+  "86": {
+    "symbol": "Rn",
+    "common_oxi": 0
+  },
+  "87": {
+    "symbol": "Fr",
+    "common_oxi": 1
+  },
+  "88": {
+    "symbol": "Ra",
+    "common_oxi": 2
+  },
+  "89": {
+    "symbol": "Ac",
+    "common_oxi": 3
+  },
+  "90": {
+    "symbol": "Th",
+    "common_oxi": 4
+  },
+  "91": {
+    "symbol": "Pa",
+    "common_oxi": 5
+  },
+  "92": {
+    "symbol": "U",
+    "common_oxi": 6
+  },
+  "93": {
+    "symbol": "Np",
+    "common_oxi": 5
+  },
+  "94": {
+    "symbol": "Pu",
+    "common_oxi": 4
+  },
+  "95": {
+    "symbol": "Am",
+    "common_oxi": 3
+  },
+  "96": {
+    "symbol": "Cm",
+    "common_oxi": 3
+  },
+  "97": {
+    "symbol": "Bk",
+    "common_oxi": 3
+  },
+  "98": {
+    "symbol": "Cf",
+    "common_oxi": 3
+  },
+  "99": {
+    "symbol": "Es",
+    "common_oxi": 3
+  },
+  "100": {
+    "symbol": "Fm",
+    "common_oxi": 3
+  }
+}

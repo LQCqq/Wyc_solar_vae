@@ -136,7 +136,35 @@ def run(cfg: DictConfig) -> None:
         hydra.utils.log.info(f"found checkpoint: {ckpt}")
     else:
         ckpt = None
-          
+
+    # ── 热启动开关 ──────────────────────────────────────────────────────────
+    # 背景：resume_from_checkpoint 会把 Adam 优化器的动量/二阶矩估计也一起恢复。
+    # 这个统计量是按"旧loss权重(比如w_overlap=0.1)"训练时的梯度量级校准的。
+    # 如果这次训练改了 w_overlap/w_charge 这类loss权重，loss landscape会突变，
+    # 但Adam还在用旧统计量算自适应学习率 → 第一步更新就可能把权重推向极端值
+    # (实测表现为 property_loss 变成 -1.75e32 这种不可能的数字，随后全面NaN)。
+    # 修改了loss权重、只想复用旧权重当初始点时，用这个模式：只加载模型权重，
+    # 不带旧优化器状态，Adam从零状态重新校准，避免上述发散。
+    # 用法：命令行加 train.weights_only_resume=true，或在 conf/train/default.yaml
+    # 里加 weights_only_resume: true。默认false，不改变原有的完整resume行为。
+    weights_only = bool(getattr(cfg.train, 'weights_only_resume', False))
+    resume_ckpt_path = None
+
+    if ckpt is not None and weights_only:
+        hydra.utils.log.info(f"[热启动] 仅加载模型权重，不恢复优化器状态: {ckpt}")
+        state = torch.load(ckpt, map_location='cpu')
+        missing, unexpected = model.load_state_dict(state['state_dict'], strict=False)
+        if missing:
+            hydra.utils.log.info(f"  未匹配到checkpoint的权重(将保持随机初始化): {missing}")
+        if unexpected:
+            hydra.utils.log.info(f"  checkpoint中多出的权重(已忽略): {unexpected}")
+        resume_ckpt_path = None  # 关键：不传给Trainer，优化器/调度器/epoch计数全部从零开始
+    elif ckpt is not None:
+        hydra.utils.log.info(f"[完整resume] 恢复权重+优化器状态+epoch计数: {ckpt}")
+        resume_ckpt_path = ckpt
+    else:
+        hydra.utils.log.info("未找到checkpoint，从头开始训练")
+
     hydra.utils.log.info("Instantiating the Trainer")
     trainer = pl.Trainer(
         default_root_dir=hydra_dir,
@@ -145,8 +173,8 @@ def run(cfg: DictConfig) -> None:
         callbacks=callbacks,
         deterministic=cfg.train.deterministic,
         check_val_every_n_epoch=cfg.logging.val_check_interval,
-        progress_bar_refresh_rate=cfg.logging.progress_bar_refresh_rate,
-        resume_from_checkpoint=ckpt,
+        #progress_bar_refresh_rate=cfg.logging.progress_bar_refresh_rate,
+        resume_from_checkpoint=resume_ckpt_path,
         **cfg.train.pl_trainer,
     )
     log_hyperparameters(trainer=trainer, model=model, cfg=cfg)

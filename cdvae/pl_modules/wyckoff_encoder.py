@@ -69,6 +69,13 @@ class WyckoffEmbedding(nn.Module):
         self.fc_var = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, data, elem_mask=None):
+        # Embedding 越界检测：CUDA 上越界会污染整个 context，后续算子抛出无关错误
+        for _t, _n, _nm in [(data.wyk_letters,    self.letter_emb.num_embeddings,  'wyk_letters'),
+                            (data.wyk_atom_types, self.element_emb.num_embeddings, 'wyk_atom_types'),
+                            (data.spg_idx,        self.spg_emb.num_embeddings,     'spg_idx')]:
+            _tc = _t.detach().cpu()
+            if int(_tc.min()) < 0 or int(_tc.max()) >= _n:
+                raise RuntimeError(f"[越界] {_nm}: 范围[{int(_tc.min())},{int(_tc.max())}] 容量 {_n}")
         letter_feat = self.letter_emb(data.wyk_letters)
         elem_feat = self.element_emb(data.wyk_atom_types)
         if elem_mask is not None:
@@ -103,7 +110,13 @@ class WyckoffEmbedding(nn.Module):
             enc_padding_mask[i, :n] = False
             offset += int(num_sites_safe[i].item())
         # SAB：sites之间self-attention，丰富per-site表示
+        # 全padding行会让softmax(全-inf)=NaN：临时放开首位，算完还原
+        _all_pad = enc_padding_mask.all(dim=1)
+        if _all_pad.any():
+            enc_padding_mask[_all_pad, 0] = False
         enriched = self.sab(padded, key_padding_mask=enc_padding_mask)  # (B, max_sites, D)
+        if _all_pad.any():
+            enc_padding_mask[_all_pad, 0] = True
         # Per-site latent：每个site的mu和log_var（消除cross-attention shortcut）
         per_site_mu = self.per_site_mu_head(enriched)           # (B, max_sites, D)
         per_site_log_var = self.per_site_log_var_head(enriched)  # (B, max_sites, D)

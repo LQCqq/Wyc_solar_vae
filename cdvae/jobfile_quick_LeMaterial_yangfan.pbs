@@ -1,0 +1,23 @@
+#!/bin/bash
+
+#PBS -N LeMat_bench_yangfan
+
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
+
+#PBS -l walltime=12:00:00
+
+#PBS -M z5561341@ad.unsw.edu.au
+
+#PBS -m ae
+
+#PBS -j oe
+
+export UV_CACHE_DIR=/srv/scratch/ml4matdis/Quanli_Project/.cache/uv
+mkdir -p $UV_CACHE_DIR
+export HF_HOME=/srv/scratch/ml4matdis/Quanli_Project/.cache/huggingface
+mkdir -p $HF_HOME
+
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/lemat-genbench
+source /srv/scratch/z5561341/miniconda3/bin/activate
+conda activate cdvae
+uv run scripts/run_benchmarks.py --cifs /srv/scratch/ml4matdis/Quanli_Project/z5561341/yangfan_cifs/ --config comprehensive_multi_mlip_hull --name my_benchmark

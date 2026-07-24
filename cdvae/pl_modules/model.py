@@ -161,6 +161,9 @@ class WyckoffCDVAE(BaseModule):
             w_elem=self.hparams.w_elem,
             w_letter=self.hparams.w_letter,
             w_free=self.hparams.w_free,
+            w_nsites=getattr(self.hparams, 'w_nsites', 0.5),
+            w_overlap=getattr(self.hparams, 'w_overlap', 0.0),
+            w_charge=getattr(self.hparams, 'w_charge', 0.0),
         )
 
         # diffusion步数
@@ -177,6 +180,9 @@ class WyckoffCDVAE(BaseModule):
 
     
     def reparameterize(self, mu, log_var):
+        # 修复：防止log_var过大exp()溢出、NaN穿透clamp
+        log_var = torch.nan_to_num(log_var, nan=-10.0, posinf=2.0, neginf=-10.0).clamp(-10.0, 2.0)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1e4, neginf=-1e4)
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -218,14 +224,21 @@ class WyckoffCDVAE(BaseModule):
             offset += cnt
 
         # 构建noisy_elem_ids：masked位点置0（MASK token），其余保留原始元素ID
-        noisy_elem_ids = targets['elem_target'].clone()  # (B, max_sites)
+        # +1：0 保留给 MASK，元素占 1..100，与 noisy_elem_emb=Embedding(101)
+        # 及 decode_to_wyckoff 生成端的 +1 对齐（否则训练/生成错位一格，
+        # 且 elem_target=0 会与 MASK 撞车）
+        noisy_elem_ids = targets['elem_target'] + 1  # (B, max_sites)
         noisy_elem_ids[masked_sites] = 0  # 0 = MASK token
 
         # letter diffusion: 同一批masked位点也mask letter
-        noisy_letter_ids = targets['letter_target'].clone()  # (B, max_sites)
+        noisy_letter_ids = targets['letter_target'] + 1  # (B, max_sites)
         noisy_letter_ids[masked_sites] = 0  # 0 = MASK token
 
         # 对per-site latent reparameterize（仅valid sites）
+        per_site_log_var = torch.nan_to_num(
+            per_site_log_var, nan=-10.0, posinf=2.0, neginf=-10.0
+        ).clamp(-10.0, 2.0)
+        per_site_mu = torch.nan_to_num(per_site_mu, nan=0.0, posinf=1e4, neginf=-1e4)
         eps_site = torch.randn_like(per_site_mu)
         per_site_z = per_site_mu + eps_site * torch.exp(0.5 * per_site_log_var)
 
@@ -254,6 +267,8 @@ class WyckoffCDVAE(BaseModule):
 
         # Per-site KL（只对valid sites计算）
         site_valid = ~enc_padding_mask  # (B, max_sites), True=valid
+        # per_site_log_var 同样需要 clamp，防止 exp() 溢出产生 NaN（与 kld_loss 的 log_var 同理）
+        per_site_log_var = per_site_log_var.clamp(-10, 2)
         kld_site = -0.5 * (1 + per_site_log_var - per_site_mu.pow(2) - per_site_log_var.exp())
         kld_site = (kld_site * site_valid.unsqueeze(-1).float()).sum() / site_valid.float().sum().clamp(min=1)
 
@@ -261,6 +276,16 @@ class WyckoffCDVAE(BaseModule):
             property_loss = F.mse_loss(self.fc_property(z).squeeze(-1), batch.y)
         else:
             property_loss = torch.tensor(0., device=mu.device)
+
+        # sm_90 修复：kld_loss/kld_site/property_loss 是 loss_dict 里仅剩的
+        # 未经处理的原始 GPU tensor（仍带 grad_fn）。异步 CUDA 执行在 sm_90 上
+        # 会让 isnan() 检查读到尚未落定的瞬时垃圾值（表现为 training_step 里
+        # 反复标记这三者异常，但稍后 .item() 读回来又是正常数）。
+        # 用 nan_to_num 立即处理：既强制同步，又清除真实的 NaN/Inf，
+        # 且保留 grad_fn（不 detach），不影响反向传播。
+        kld_loss = torch.nan_to_num(kld_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        kld_site = torch.nan_to_num(kld_site, nan=0.0, posinf=0.0, neginf=0.0)
+        property_loss = torch.nan_to_num(property_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         # total loss
         total_loss = (
@@ -303,6 +328,7 @@ class WyckoffCDVAE(BaseModule):
             .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
             .clamp(0, 229).long()
         )
+        batch.spg_idx = spg_idx_cpu.to(device)
 
         # wyk_lattice: (N_total, 6) 或 (B, 6) 浮点，直接nan_to_num后reshape
         # 这是 test_loss_lattice=nan 的直接根因：H200/sm_90 上 batch.wyk_lattice
@@ -333,7 +359,20 @@ class WyckoffCDVAE(BaseModule):
         elem_target   = torch.zeros(B, S, dtype=torch.long, device=device)
         letter_target = torch.zeros(B, S, dtype=torch.long, device=device)
         free_target   = torch.zeros(B, S, 3,                device=device)
+        multi_target  = torch.ones(B,  S,                   device=device)  # 默认1（不加权）
         site_mask     = torch.zeros(B, S, dtype=torch.bool, device=device)
+
+        # multiplicity：尝试从 batch.wyk_multi 读取，不存在则保持默认值1
+        # （wyk_multi 由 dataset.py 从 encode_wyckoff_tensors 的 multiplicities 字段存入）
+        multi_cpu = None
+        for attr in ['wyk_multi', 'multiplicities']:
+            if hasattr(batch, attr):
+                try:
+                    multi_cpu = getattr(batch, attr).cpu().float()
+                    multi_cpu = multi_cpu.nan_to_num(nan=1.0, posinf=1.0, neginf=1.0)
+                    break
+                except Exception:
+                    pass
 
         # site_batch_idx(repeat_interleave产出的单调不减序列)在flat张量中每个
         # 结构i对应连续一段——用offset连续切片(与wyckoff_encoder.py一致，已验证
@@ -346,6 +385,8 @@ class WyckoffCDVAE(BaseModule):
                 elem_target[i,   :n]    = atom_types_cpu[offset:offset + n].to(device)
                 letter_target[i, :n]    = letters_cpu[offset:offset + n].to(device)
                 free_target[i,   :n, :] = free_cpu[offset:offset + n].to(device)
+                if multi_cpu is not None:
+                    multi_target[i, :n] = multi_cpu[offset:offset + n].to(device)
                 site_mask[i,     :n]    = True
             offset += cnt
 
@@ -359,11 +400,16 @@ class WyckoffCDVAE(BaseModule):
             'elem_target':      elem_target,
             'letter_target':    letter_target,
             'free_target':      free_target,
+            'multiplicities':   multi_target,   # charge penalty 使用
         }
         return targets, site_mask
 
 
     def kld_loss(self, mu, log_var):
+        # clamp 防止 exp() 溢出：log_var > 88 时 exp(log_var) > float32 上限
+        # → +inf → inf - inf = nan → val_loss=nan → EarlyStopping 误杀训练
+        log_var = torch.nan_to_num(log_var, nan=-10.0, posinf=2.0, neginf=-10.0).clamp(-10.0, 2.0)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=1e4, neginf=-1e4)
         return torch.mean(
             -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1)
         )
@@ -371,6 +417,18 @@ class WyckoffCDVAE(BaseModule):
    
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
+        # ── [CONFIG] 打印真正生效的权重（读self.recon_loss内部实际存的值，
+        # 不是self.hparams表面值，避免getattr默认值/Hydra读取问题被掩盖）──
+        if batch_idx == 0:
+            print(f"[CONFIG] w_spg={self.recon_loss.w_spg} "
+                  f"w_lattice={self.recon_loss.w_lattice} "
+                  f"w_elem={self.recon_loss.w_elem} "
+                  f"w_letter={self.recon_loss.w_letter} "
+                  f"w_free={self.recon_loss.w_free} "
+                  f"w_nsites={self.recon_loss.w_nsites} "
+                  f"w_overlap={self.recon_loss.w_overlap} "
+                  f"w_charge={self.recon_loss.w_charge} "
+                  f"beta={self.hparams.beta}", flush=True)
         # ── [临时诊断] 打印前5个batch的完整loss_dict，定位nan第一次出现 ──
         # 注意: loss_dict里的大部分项已经是.item()过的Python float
         # (见WyckoffReconLoss.forward的return)，但kld_loss/kld_site/
@@ -383,6 +441,23 @@ class WyckoffCDVAE(BaseModule):
             debug_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
             print(f"[DEBUG step{batch_idx}] total_loss={total_loss.item()} "
                   f"loss_dict={debug_dict}", flush=True)
+        # 最终保障：NaN/Inf 进入 total_loss 会用 NaN 梯度污染所有权重，
+        # 且会导致 val_loss 长期失真（被后续环节的 nan_to_num 压成 0），
+        # EarlyStopping 误判"已收敛"而静默提前停止（之前踩过这个坑，
+        # 但该保护此前未真正部署到 training_step，这次补上）。
+        # nan_to_num 保留 grad_fn（不 detach），NaN/Inf 处梯度自动为 0，
+        # PL 仍能正常调用 loss.backward()。
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            # 打印是哪个 loss 项导致的，方便定位根因（不受 batch_idx<5 限制，
+            # 只要出现 NaN 就打印，这样能抓到训练中期偶发的 NaN）
+            bad_keys = {k: v for k, v in loss_dict.items()
+                        if (torch.is_tensor(v) and (torch.isnan(v).any() or torch.isinf(v).any()))
+                        or (isinstance(v, float) and (v != v or abs(v) == float('inf')))}
+            full_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
+            print(f"[NaN警告][train step{batch_idx}] total_loss={total_loss.item()} "
+                  f"→ 已被nan_to_num替换为0。异常来源字段: {list(bad_keys.keys())}", flush=True)
+            print(f"  完整loss_dict: {full_dict}", flush=True)
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
         # detach带grad_fn的tensor条目(kld_loss/kld_site/property_loss)，
         # 否则 on_epoch=True 的聚合会保留整张计算图，
         # 大CPU中间张量)直到epoch结束，导致CPU内存累积OOM。
@@ -393,6 +468,14 @@ class WyckoffCDVAE(BaseModule):
 
     def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
+        # 同样加保障 + 诊断打印：val_loss 若为 NaN 会导致 EarlyStopping 行为异常
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            bad_keys = {k: v for k, v in loss_dict.items()
+                        if (torch.is_tensor(v) and (torch.isnan(v).any() or torch.isinf(v).any()))
+                        or (isinstance(v, float) and (v != v or abs(v) == float('inf')))}
+            print(f"[NaN警告][val step{batch_idx}] total_loss={total_loss.item()} "
+                  f"→ 已被nan_to_num替换为0。异常来源字段: {list(bad_keys.keys())}", flush=True)
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
         log_dict = {f'val_{k}': (v.detach() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
         log_dict['val_loss'] = total_loss.detach()
         self.log_dict(log_dict, on_step=False, on_epoch=True, prog_bar=True)
@@ -400,8 +483,12 @@ class WyckoffCDVAE(BaseModule):
 
     def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
-        log_dict = {f'test_{k}': v for k, v in loss_dict.items()}
-        log_dict['test_loss'] = total_loss
+        # 与 training_step / validation_step 保持一致：total_loss 也做 NaN 防护
+        # 之前缺了这一层，导致 checkpoint 权重退化时 test 结果直接暴露裸 nan
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        log_dict = {f'test_{k}': (v.item() if torch.is_tensor(v) else v)
+                    for k, v in loss_dict.items()}
+        log_dict['test_loss'] = total_loss.item()
         self.log_dict(log_dict)
         return total_loss
 

@@ -14,7 +14,7 @@ from mace.calculators import mace_mp
 
 
 BASE = Path("/srv/scratch/ml4matdis/Quanli_Project/z5561341")
-DEFAULT_INPUT  = BASE / "generated_structures"
+DEFAULT_INPUT  = BASE / "SMACT_structure"
 DEFAULT_OUTPUT = BASE / "MACE_structure"
 
 

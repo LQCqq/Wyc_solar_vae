@@ -36,7 +36,8 @@ w_lattice: 1.0
 w_elem: 1.0
 w_letter: 1.0
 w_free: 1.0
-w_overlap: 0.3
+w_overlap: 0.0
+w_charge: 0.0
 
 # 数据
 use_wyckoff: true

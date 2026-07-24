@@ -1,26 +1,120 @@
 #!/bin/bash
 
-#PBS -N test_repeatsError
-
-#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
-
-#PBS -l walltime=12:00:00
-
+#PBS -N unit_test
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb:gpu_model=H200
 #PBS -M z5561341@ad.unsw.edu.au
-
-#PBS -m ae
-
+#PBS -l walltime=02:00:00
 #PBS -j oe
+#PBS -o /srv/scratch/ml4matdis/Quanli_Project/z5561341/myLog/
 
-cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts
+# ============================================================
+# 3-epoch 短跑：验证新环境(cdvae2) + 新代码是否产出合理 loss
+# 通过之后才改成长作业跑 1000 epoch
+# 相对原脚本的改动：
+#   1) conda 环境 cdvae -> cdvae2（支持 sm_90 的新环境）
+#   2) expname 改为 smoke_test，不覆盖归档的旧结果
+#   3) max_epochs=3
+#   4) 加了部署前置检查，代码没到位就直接退出，不浪费机时
+# ============================================================
+
+PROJ=/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
+cd ${PROJ} || exit 1
+
 source /srv/scratch/z5561341/miniconda3/bin/activate
-conda activate cdvae
+conda activate cdvae2
 
+PY=$(which python)
+echo "===== 节点与环境 ====="
+hostname
+echo "python: ${PY}"
+nvidia-smi
 
-export PROJECT_ROOT=/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae
-export HYDRA_FULL_ERROR=1
+# ------------------------------------------------------------
+# 前置检查 A：环境健康（numpy<2 且 sm_90 在列），不过就直接退出
+# ------------------------------------------------------------
+echo "===== [检查A] 环境 ====="
+python - << 'EOF' || { echo "!!! 环境检查未通过，作业终止"; exit 1; }
+import sys, numpy, torch
+print('numpy      :', numpy.__version__)
+print('torch      :', torch.__version__)
+print('arch list  :', torch.cuda.get_arch_list())
+ok = True
+if int(numpy.__version__.split('.')[0]) >= 2:
+    print('!!! numpy 必须 <2（torch 2.0.1 的 numpy 桥接会坏）'); ok = False
+if 'sm_90' not in torch.cuda.get_arch_list():
+    print('!!! sm_90 不在 arch list'); ok = False
+try:
+    torch.from_numpy(numpy.eye(3)); torch.randn(3,3).numpy()
+    print('numpy<->torch 桥接: OK')
+except Exception as e:
+    print('!!! numpy<->torch 桥接坏了:', e); ok = False
+sys.exit(0 if ok else 1)
+EOF
+
+# ------------------------------------------------------------
+# 前置检查 B：新代码是否真的部署了（防止"修复丢失"重演）
+# ------------------------------------------------------------
+echo "===== [检查B] 代码部署 ====="
+MISS=0
+check() {
+    n=$(grep -c "$2" "$1" 2>/dev/null)
+    if [ "$n" -ge 1 ]; then
+        echo "  OK   $1 : $3"
+    else
+        echo "  MISS $1 : $3"
+        MISS=1
+    fi
+}
+check pl_modules/wyckoff_encoder.py "越界"                        "E1 Embedding越界检测"
+check pl_modules/wyckoff_encoder.py "全padding行会让softmax"      "E2 SAB全掩码防护"
+check pl_modules/wyckoff_decoder.py "全padding行会让softmax"      "D1 cross_attn全掩码防护"
+check pl_modules/model.py           "per_site_log_var = torch.nan_to_num" "M1 per_site清洗"
+check pl_modules/model.py           "batch.spg_idx = spg_idx_cpu" "M3 spg_idx写回"
+if [ "$MISS" -eq 1 ]; then
+    echo "!!! 有修改未部署，作业终止"
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# 前置检查 C：顶层定义不能重复（重复会导致后定义覆盖先定义）
+# ------------------------------------------------------------
+echo "===== [检查C] 重复定义扫描（应无输出）====="
+for f in pl_modules/*.py; do
+    d=$(grep "^class \|^def " "$f" | sort | uniq -d)
+    [ -n "$d" ] && echo "  !!! $f 重复定义: $d"
+done
+
+# ------------------------------------------------------------
+# 清缓存
+# ------------------------------------------------------------
+find ${PROJ} -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null
+echo "__pycache__ 已清"
+
+# ------------------------------------------------------------
+# 训练
+# ------------------------------------------------------------
+TODAY=$(date +%Y-%m-%d)
+OUTDIR="/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/${TODAY}/smoke_test"
+mkdir -p ${OUTDIR}
+echo "输出目录: ${OUTDIR}"
+
+# PYTHONUNBUFFERED：让 print 按顺序即时刷出，便于读 [DEBUG] 时序
+# HYDRA_FULL_ERROR：报错时给完整 traceback，而不是 hydra 的精简版
+# CUDA_LAUNCH_BLOCKING=1：短跑保留，报错定位准确；1000epoch 长跑时务必删掉（很慢）
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=""   # 强制CPU，避免CUDA异步错误掩盖真凶
-# -u 强制无缓冲；同时 tee 一份到独立日志，双保险
-python -u pyxtal_build_test.py 2>&1 | tee diag_numsites_log.txt
-echo "=== exit code: ${PIPESTATUS[0]} ==="
+export HYDRA_FULL_ERROR=1
+
+WANDB_API_KEY="" WANDB_MODE=disabled CUDA_LAUNCH_BLOCKING=1 \
+python run.py \
+    data=mp_20 \
+    model=wyckoff_cdvae \
+    expname=smoke_test \
+    logging.wandb.mode=disabled \
+    train.pl_trainer.max_epochs=3 \
+    "hydra.run.dir=${OUTDIR}"
+
+echo "===== 短跑结束 ====="
+echo "请检查上面的 [DEBUG step0-4]："
+echo "  1) 量级：各项 loss 应在 0.x ~ 几十，不应出现 e-42/e-45"
+echo "  2) 一致性：total_loss 应约等于各项按权重相加"
+echo "  3) 符号：loss_lattice / loss_free 等 MSE 项必须非负"

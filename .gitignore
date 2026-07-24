@@ -13,6 +13,10 @@ cdvae_outputs/
 dist/
 build/
 .eggs/
-projectA/
-cdvae/
 Wyckoff_Training.*
+.env.bak*
+*.bak_*
+
+# PBS 作业输出
+*.o[0-9]*
+*.e[0-9]*

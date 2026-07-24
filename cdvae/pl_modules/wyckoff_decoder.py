@@ -193,10 +193,16 @@ class WyckoffDecoder(nn.Module):
 
         # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用）
         if per_site_z is not None:
+            # 全padding行会让softmax(全-inf)=NaN：临时放开首位，算完还原
+            _all_pad = enc_padding_mask.all(dim=1) if enc_padding_mask is not None else None
+            if _all_pad is not None and _all_pad.any():
+                enc_padding_mask[_all_pad, 0] = False
             ca_out, _ = self.cross_attn(
                 site_feats, per_site_z, per_site_z,
                 key_padding_mask=enc_padding_mask
             )
+            if _all_pad is not None and _all_pad.any():
+                enc_padding_mask[_all_pad, 0] = True
             site_feats = self.cross_attn_norm(site_feats + ca_out)
 
         elem_logits = self.element_head(site_feats)

@@ -1,0 +1,402 @@
+{
+  "1": {
+    "symbol": "H",
+    "radius_A": 0.25
+  },
+  "2": {
+    "symbol": "He",
+    "radius_A": 1.0
+  },
+  "3": {
+    "symbol": "Li",
+    "radius_A": 1.45
+  },
+  "4": {
+    "symbol": "Be",
+    "radius_A": 1.05
+  },
+  "5": {
+    "symbol": "B",
+    "radius_A": 0.85
+  },
+  "6": {
+    "symbol": "C",
+    "radius_A": 0.7
+  },
+  "7": {
+    "symbol": "N",
+    "radius_A": 0.65
+  },
+  "8": {
+    "symbol": "O",
+    "radius_A": 0.6
+  },
+  "9": {
+    "symbol": "F",
+    "radius_A": 0.5
+  },
+  "10": {
+    "symbol": "Ne",
+    "radius_A": 1.0
+  },
+  "11": {
+    "symbol": "Na",
+    "radius_A": 1.8
+  },
+  "12": {
+    "symbol": "Mg",
+    "radius_A": 1.5
+  },
+  "13": {
+    "symbol": "Al",
+    "radius_A": 1.25
+  },
+  "14": {
+    "symbol": "Si",
+    "radius_A": 1.1
+  },
+  "15": {
+    "symbol": "P",
+    "radius_A": 1.0
+  },
+  "16": {
+    "symbol": "S",
+    "radius_A": 1.0
+  },
+  "17": {
+    "symbol": "Cl",
+    "radius_A": 1.0
+  },
+  "18": {
+    "symbol": "Ar",
+    "radius_A": 0.71
+  },
+  "19": {
+    "symbol": "K",
+    "radius_A": 2.2
+  },
+  "20": {
+    "symbol": "Ca",
+    "radius_A": 1.8
+  },
+  "21": {
+    "symbol": "Sc",
+    "radius_A": 1.6
+  },
+  "22": {
+    "symbol": "Ti",
+    "radius_A": 1.4
+  },
+  "23": {
+    "symbol": "V",
+    "radius_A": 1.35
+  },
+  "24": {
+    "symbol": "Cr",
+    "radius_A": 1.4
+  },
+  "25": {
+    "symbol": "Mn",
+    "radius_A": 1.4
+  },
+  "26": {
+    "symbol": "Fe",
+    "radius_A": 1.4
+  },
+  "27": {
+    "symbol": "Co",
+    "radius_A": 1.35
+  },
+  "28": {
+    "symbol": "Ni",
+    "radius_A": 1.35
+  },
+  "29": {
+    "symbol": "Cu",
+    "radius_A": 1.35
+  },
+  "30": {
+    "symbol": "Zn",
+    "radius_A": 1.35
+  },
+  "31": {
+    "symbol": "Ga",
+    "radius_A": 1.3
+  },
+  "32": {
+    "symbol": "Ge",
+    "radius_A": 1.25
+  },
+  "33": {
+    "symbol": "As",
+    "radius_A": 1.15
+  },
+  "34": {
+    "symbol": "Se",
+    "radius_A": 1.15
+  },
+  "35": {
+    "symbol": "Br",
+    "radius_A": 1.15
+  },
+  "36": {
+    "symbol": "Kr",
+    "radius_A": 1.0
+  },
+  "37": {
+    "symbol": "Rb",
+    "radius_A": 2.35
+  },
+  "38": {
+    "symbol": "Sr",
+    "radius_A": 2.0
+  },
+  "39": {
+    "symbol": "Y",
+    "radius_A": 1.8
+  },
+  "40": {
+    "symbol": "Zr",
+    "radius_A": 1.55
+  },
+  "41": {
+    "symbol": "Nb",
+    "radius_A": 1.45
+  },
+  "42": {
+    "symbol": "Mo",
+    "radius_A": 1.45
+  },
+  "43": {
+    "symbol": "Tc",
+    "radius_A": 1.35
+  },
+  "44": {
+    "symbol": "Ru",
+    "radius_A": 1.3
+  },
+  "45": {
+    "symbol": "Rh",
+    "radius_A": 1.35
+  },
+  "46": {
+    "symbol": "Pd",
+    "radius_A": 1.4
+  },
+  "47": {
+    "symbol": "Ag",
+    "radius_A": 1.6
+  },
+  "48": {
+    "symbol": "Cd",
+    "radius_A": 1.55
+  },
+  "49": {
+    "symbol": "In",
+    "radius_A": 1.55
+  },
+  "50": {
+    "symbol": "Sn",
+    "radius_A": 1.45
+  },
+  "51": {
+    "symbol": "Sb",
+    "radius_A": 1.45
+  },
+  "52": {
+    "symbol": "Te",
+    "radius_A": 1.4
+  },
+  "53": {
+    "symbol": "I",
+    "radius_A": 1.4
+  },
+  "54": {
+    "symbol": "Xe",
+    "radius_A": 1.0
+  },
+  "55": {
+    "symbol": "Cs",
+    "radius_A": 2.6
+  },
+  "56": {
+    "symbol": "Ba",
+    "radius_A": 2.15
+  },
+  "57": {
+    "symbol": "La",
+    "radius_A": 1.95
+  },
+  "58": {
+    "symbol": "Ce",
+    "radius_A": 1.85
+  },
+  "59": {
+    "symbol": "Pr",
+    "radius_A": 1.85
+  },
+  "60": {
+    "symbol": "Nd",
+    "radius_A": 1.85
+  },
+  "61": {
+    "symbol": "Pm",
+    "radius_A": 1.85
+  },
+  "62": {
+    "symbol": "Sm",
+    "radius_A": 1.85
+  },
+  "63": {
+    "symbol": "Eu",
+    "radius_A": 1.85
+  },
+  "64": {
+    "symbol": "Gd",
+    "radius_A": 1.8
+  },
+  "65": {
+    "symbol": "Tb",
+    "radius_A": 1.75
+  },
+  "66": {
+    "symbol": "Dy",
+    "radius_A": 1.75
+  },
+  "67": {
+    "symbol": "Ho",
+    "radius_A": 1.75
+  },
+  "68": {
+    "symbol": "Er",
+    "radius_A": 1.75
+  },
+  "69": {
+    "symbol": "Tm",
+    "radius_A": 1.75
+  },
+  "70": {
+    "symbol": "Yb",
+    "radius_A": 1.75
+  },
+  "71": {
+    "symbol": "Lu",
+    "radius_A": 1.75
+  },
+  "72": {
+    "symbol": "Hf",
+    "radius_A": 1.55
+  },
+  "73": {
+    "symbol": "Ta",
+    "radius_A": 1.45
+  },
+  "74": {
+    "symbol": "W",
+    "radius_A": 1.35
+  },
+  "75": {
+    "symbol": "Re",
+    "radius_A": 1.35
+  },
+  "76": {
+    "symbol": "Os",
+    "radius_A": 1.3
+  },
+  "77": {
+    "symbol": "Ir",
+    "radius_A": 1.35
+  },
+  "78": {
+    "symbol": "Pt",
+    "radius_A": 1.35
+  },
+  "79": {
+    "symbol": "Au",
+    "radius_A": 1.35
+  },
+  "80": {
+    "symbol": "Hg",
+    "radius_A": 1.5
+  },
+  "81": {
+    "symbol": "Tl",
+    "radius_A": 1.9
+  },
+  "82": {
+    "symbol": "Pb",
+    "radius_A": 1.8
+  },
+  "83": {
+    "symbol": "Bi",
+    "radius_A": 1.6
+  },
+  "84": {
+    "symbol": "Po",
+    "radius_A": 1.9
+  },
+  "85": {
+    "symbol": "At",
+    "radius_A": 1.0
+  },
+  "86": {
+    "symbol": "Rn",
+    "radius_A": 1.0
+  },
+  "87": {
+    "symbol": "Fr",
+    "radius_A": 1.0
+  },
+  "88": {
+    "symbol": "Ra",
+    "radius_A": 2.15
+  },
+  "89": {
+    "symbol": "Ac",
+    "radius_A": 1.95
+  },
+  "90": {
+    "symbol": "Th",
+    "radius_A": 1.8
+  },
+  "91": {
+    "symbol": "Pa",
+    "radius_A": 1.8
+  },
+  "92": {
+    "symbol": "U",
+    "radius_A": 1.75
+  },
+  "93": {
+    "symbol": "Np",
+    "radius_A": 1.75
+  },
+  "94": {
+    "symbol": "Pu",
+    "radius_A": 1.75
+  },
+  "95": {
+    "symbol": "Am",
+    "radius_A": 1.75
+  },
+  "96": {
+    "symbol": "Cm",
+    "radius_A": 1.0
+  },
+  "97": {
+    "symbol": "Bk",
+    "radius_A": 1.0
+  },
+  "98": {
+    "symbol": "Cf",
+    "radius_A": 1.0
+  },
+  "99": {
+    "symbol": "Es",
+    "radius_A": 1.0
+  },
+  "100": {
+    "symbol": "Fm",
+    "radius_A": 1.0
+  }
+}

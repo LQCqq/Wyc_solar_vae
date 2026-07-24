@@ -1,0 +1,16 @@
+#!/bin/bash
+
+#PBS -N project_rsync
+
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
+
+#PBS -l walltime=12:00:00
+
+#PBS -M z5561341@ad.unsw.edu.au
+
+#PBS -m ae
+
+#PBS -j oe
+
+rsync -av --progress /srv/scratch/z5561341 /srv/scratch/ml4matdis/Quanli_Project
+

@@ -1,0 +1,18 @@
+#!/bin/bash
+
+#PBS -N wyk_ops_lookup
+
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
+
+#PBS -l walltime=12:00:00
+
+#PBS -M z5561341@ad.unsw.edu.au
+
+#PBS -m ae
+
+#PBS -j oe
+
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
+source /srv/scratch/z5561341/miniconda3/bin/activate
+conda activate cdvae
+python 

@@ -1,0 +1,29 @@
+#!/bin/bash
+
+#PBS -N Mace_relax
+
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
+
+#PBS -l walltime=12:00:00
+
+#PBS -M z5561341@ad.unsw.edu.au
+
+#PBS -m ae
+
+#PBS -j oe
+SCRATCH=/srv/scratch/ml4matdis/Quanli_Project/z5561341
+SCRIPTS=$SCRATCH/projectA/cdvae/scripts
+INPUT=$SCRATCH/SMACT_structure
+OUTPUT=$SCRATCH/MACE_structure
+
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
+source /srv/scratch/z5561341/miniconda3/bin/activate
+conda activate mace
+python $SCRIPTS/mace_relax.py \
+    --input_dir  $INPUT  \
+    --output_dir $OUTPUT \
+    --device     cuda    \
+    --mace_model medium-mpa-0  \
+    --fmax       0.05    \
+    --max_steps  300     \
+	--relax_cell
