@@ -14,5 +14,5 @@
 
 cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
-conda activate cdvae
+conda activate cdvae2
 python /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts/generate_wyckoff.py 

@@ -233,10 +233,15 @@ class WyckoffDecoder(nn.Module):
             """返回该SPG合法的letter的0/1 mask"""
             try:
                 from pyxtal.symmetry import Group
+                from cdvae.pl_data.wyckoff_utils import WYCKOFF_LETTERS
                 g = Group(int(spg_num))
                 mask = torch.zeros(num_letters, device=device)
-                for i in range(len(g.Wyckoff_positions)):
-                    if i < num_letters:
+                # 按字母名对齐：pyxtal 的 Wyckoff_positions 按多重度排序，
+                # 与模型 letter 类别的字母序不一致，必须按字母匹配而非位置，
+                # 否则会随机允许非法 letter、禁止合法 letter
+                letters_avail = {wp.letter for wp in g.Wyckoff_positions}
+                for i, ch in enumerate(WYCKOFF_LETTERS[:num_letters]):
+                    if ch in letters_avail:
                         mask[i] = 1.0
                 return mask if mask.sum() > 0 else torch.ones(num_letters, device=device)
             except:
@@ -340,7 +345,7 @@ class WyckoffDecoder(nn.Module):
                 'site_elements': elements,
                 'site_letters': letters,
                 'site_free_params': free_params,
-                'lattice_params': _fix_lattice(preds['lattice_pred'][i].cpu().numpy(), n_atoms=_n_atoms),
+                'lattice_params': _fix_lattice(preds['lattice_pred'][i].cpu().numpy() * _np.array([10., 10., 10., 90., 90., 90.]), n_atoms=_n_atoms),  # ×lat_scale 还原归一化（训练时 target/lat_scale，生成必须乘回）
                 'num_sites': n_sites,
             })
         return results

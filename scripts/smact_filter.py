@@ -2,14 +2,7 @@
 smact_charge_filter.py
 ───────────────────────
 用 SMACT 对已生成的 CIF 结构做电荷中性硬过滤：
-  - 训练时的 loss_charge 是软约束，不保证100%达标
-  - 这个脚本是后处理硬过滤：不满足电荷平衡氧化态组合的结构直接剔除
-  - 最终输出目录里的结构保证 100% 通过 SMACT 电荷中性检验
-
-用法：
-  python smact_charge_filter.py \
-      --input_dir  /path/to/generated_structures \
-      --output_dir /path/to/generated_structures_charge_valid
+ 
 """
 
 import argparse

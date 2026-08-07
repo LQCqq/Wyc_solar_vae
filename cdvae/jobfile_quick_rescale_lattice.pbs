@@ -1,8 +1,8 @@
 #!/bin/bash
 
-#PBS -N SMACT_filter
+#PBS -N rescale_lattice
 
-#PBS -l select=1:ncpus=8:mem=46gb:ngpus=0
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=1
 
 #PBS -l walltime=12:00:00
 
@@ -13,13 +13,13 @@
 #PBS -j oe
 SCRATCH=/srv/scratch/ml4matdis/Quanli_Project/z5561341
 SCRIPTS=$SCRATCH/projectA/cdvae/scripts
-INPUT=$SCRATCH/generated_structures/formal_structure
-OUTPUT=$SCRATCH/SMACT_structure/formal_smact_structure
+INPUT=$SCRATCH/SMACT_structure
+OUTPUT=$SCRATCH/Rescale_lattice_structure
 
 cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae
-python $SCRIPTS/smact_filter.py \
+python $SCRIPTS/rescale_cell_lattice.py \
     --input_dir  $INPUT  \
     --output_dir $OUTPUT \
    

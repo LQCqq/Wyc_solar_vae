@@ -123,14 +123,20 @@ def _lattice_matrix_cpu(lattice_pred_row):
 def _overlap_penalty(preds, targets, site_mask):
     
     orig_device = preds['free_params'].device
-    free_params  = preds['free_params'].cpu().detach().float()   # (B, S, 3)
-    lattice_pred = preds['lattice_pred'].cpu().detach().float()  # (B, 6)
+    # free_params 不 detach：轨道展开 pos=R@fp+t、% 1.0、@lat_mat、relu 全可导，
+    # 梯度可回传到分数坐标，模型才学得到"别把原子放在对称元素上"。
+    # lattice_pred 仍 detach：_lattice_matrix_cpu 全是 .item()/numpy，接不回梯度，
+    # 晶胞过小导致的重叠由生成端 _fix_lattice 的动态长度下限兜底。
+    free_params  = preds['free_params'].cpu().float()            # (B, S, 3) 带梯度
+    # lattice_pred 是归一化量（loss 里比的是 target/lat_scale），必须先还原成
+    # 真实的 Å 和度，否则 _lattice_matrix_cpu 会把 ~0.5 的边长 clamp 到 1.0 Å、
+    # 把 ~1.0 的角度当成弧度 → 得到 1×1×1Å 的假晶胞 → 所有原子都被判为重叠
+    _LAT_SCALE = torch.tensor([10., 10., 10., 90., 90., 90.])
+    lattice_pred = preds['lattice_pred'].cpu().detach().float() * _LAT_SCALE  # (B, 6) 常数
     spg_target   = targets['spg_target'].cpu()                   # (B,)
     letter_target = targets['letter_target'].cpu()               # (B, S)
     elem_target  = targets['elem_target'].cpu()                  # (B, S)
     mask         = site_mask.cpu().float()                       # (B, S)
-
-    free_grad = preds['free_params']  # (B, S, 3) on orig_device, with grad
 
     B, S, _ = free_params.shape
     SM = S * _MAX_MULT
@@ -154,7 +160,9 @@ def _overlap_penalty(preds, targets, site_mask):
             if mask[b, s] < 0.5:
                 continue
             letter_idx = int(letter_target[b, s].item())
-            elem_Z     = int(elem_target[b, s].item())
+            # elem_target 存的是类别(0-indexed)，radii_table 按原子序数 Z 索引，
+            # Z = class + 1（与 decoder 里 argmax()+1 的约定一致），必须 +1
+            elem_Z     = int(elem_target[b, s].item()) + 1
             fp         = free_params[b, s]   # (3,) CPU, no grad
 
             R, t, R0, t0, op_mask = _get_ops_cpu(spg_num, letter_idx)
@@ -186,7 +194,12 @@ def _overlap_penalty(preds, targets, site_mask):
         if N < 2:
             continue
 
-        diff = cart_all.unsqueeze(1) - cart_all.unsqueeze(0)  # (N, N, 3)
+        # 最小镜像约定：先在分数空间取周期最近邻，再转笛卡尔，
+        # 否则分数 0.02 与 0.98（隔晶胞边界，实际仅差 0.04）会被算成 ~0.96 的假距离，
+        # 漏判跨边界的重叠（<0.5Å 那批的主要来源）
+        fdiff = frac_all.unsqueeze(1) - frac_all.unsqueeze(0)  # (N, N, 3)
+        fdiff = fdiff - fdiff.round()                          # 映射到 [-0.5, 0.5)
+        diff = fdiff @ lat_mat.T                               # (N, N, 3) 笛卡尔
         dist = (diff ** 2).sum(-1).clamp(min=1e-12).sqrt()    # (N, N)
 
         # distance from lemat
@@ -205,11 +218,15 @@ def _overlap_penalty(preds, targets, site_mask):
         # hinge penalty：超过阈值的对贡献 0，重叠的对贡献正值
         violation = F.relu(threshold - dist) * pair_mask  # (N, N)
 
-        n_pairs = pair_mask.sum().clamp(min=1)
-        batch_penalty = violation.sum() / n_pairs
+        # 除以「违反的对数」而非 N²：原先除 N² 会把 1 对真实重叠
+        # 摊薄进几百对正常原子里（N=20 时信号缩水 ~400 倍），尾部重叠压不下去。
+        # 现在只对真正违反的对取均值，重叠越多惩罚越大，信号不被稀释。
+        n_viol = (violation > 0).float().sum().clamp(min=1)
+        batch_penalty = violation.sum() / n_viol
 
-        fp_sum = free_grad[b][mask[b].bool()].sum() * 0
-        total_penalty = total_penalty + batch_penalty.to(orig_device) + fp_sum
+        # batch_penalty 现在自带来自 free_params 的真实梯度，
+        # 原先 "+ free_grad.sum()*0" 的桥接已无必要（且它把梯度也一并归零了）
+        total_penalty = total_penalty + batch_penalty.to(orig_device)
         n_valid += 1
 
     if n_valid == 0:
@@ -231,8 +248,10 @@ def _charge_neutrality_penalty(preds, targets, site_mask):
     mask = site_mask.float()                      # (B, S)
     device = elem_logits.device
 
-    oxi_table = _get_oxi_tensor(device)          # (101,)
-    oxi_per_elem = oxi_table[:100]               # (100,) index k → oxi(Z=k)，与 elem_logits class k 对齐
+    oxi_table = _get_oxi_tensor(device)          # (101,) 按原子序数 Z 索引
+    # elem_logits 的类别 k 对应 Z = k+1（与 decoder 的 argmax()+1 一致），
+    # 所以要取 [1:101] 而不是 [:100]，否则每个元素拿到的是 Z-1 那个元素的氧化态
+    oxi_per_elem = oxi_table[1:101]              # (100,) index k → oxi(Z=k+1)
 
     # 软概率
     probs = F.softmax(elem_logits, dim=-1)        # (B, S, 100)
@@ -341,6 +360,23 @@ class WyckoffReconLoss(nn.Module):
                 loss_charge = torch.tensor(0.0, device=preds['elem_logits'].device)
         else:
             loss_charge = torch.tensor(0.0, device=preds['elem_logits'].device)
+
+        # ── 真值基线探针（仅当环境变量 WYCKOFF_GT_PROBE=1 时启用，每次训练打印一次）──
+        # 用真值的元素/自由参数跑同样的惩罚，得到"地板值"
+        import os as _os
+        if _os.environ.get('WYCKOFF_GT_PROBE') == '1' and not getattr(self, '_gt_probe_done', False):
+            with torch.no_grad():
+                _V = preds['elem_logits'].shape[-1]
+                _onehot = F.one_hot(targets['elem_target'].clamp(0, _V - 1), num_classes=_V).float()
+                _gt_charge = _charge_neutrality_penalty(
+                    {'elem_logits': (_onehot - 0.5) * 50.0}, targets, site_mask).item()
+                _lat_norm = targets['lattice_target'] / lat_scale   # 还原成与 preds 同样的归一化尺度
+                _gt_overlap = _overlap_penalty(
+                    {'free_params': targets['free_target'], 'lattice_pred': _lat_norm},
+                    targets, site_mask).item()
+            print(f"[GT探针] 真值基线   charge={_gt_charge:12.4f}   overlap={_gt_overlap:.6f}", flush=True)
+            print(f"[GT探针] 模型输出   charge={loss_charge.item():12.4f}   overlap={loss_overlap.item():.6f}", flush=True)
+            self._gt_probe_done = True
 
         total = (
             self.w_spg     * loss_spg     +
