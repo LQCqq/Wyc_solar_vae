@@ -12,8 +12,8 @@ for pyc in pathlib.Path('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA
 os.chdir('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae')
 
 CKPT = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-07-24/test_wyckoff/epoch=96-step=10282.ckpt'
-NUM_SAMPLES = 3700
-OUT_DIR = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures/formal_structure'
+NUM_SAMPLES = 3500
+OUT_DIR = '/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures/charge_refactor_structure'
 
 from cdvae.pl_modules.model import WyckoffCDVAE
 

@@ -36,6 +36,97 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ============================================================
+# 电荷中性修正（方法1 · 注入点B）：组分确定后用 SMACT 判据检查，
+# 不通过则贪心把某个位点换成模型次高概率元素重判。
+# 与最终 smact_filter 用同一个 smact_validity，保证判据完全一致。
+# ============================================================
+def _smact_ok(elements, letters, spg_num):
+    """用 SMACT 判断 (元素 × 多重度) 组成的化学式是否电荷/氧化态合法。"""
+    try:
+        from smact.screening import smact_validity
+        from pymatgen.core import Composition
+        from pyxtal.symmetry import Group as _Group
+        # 每个位点按其 Wyckoff 多重度计数
+        try:
+            g = _Group(int(spg_num))
+            valid = {wp.letter for wp in g.Wyckoff_positions}
+            counts = {}
+            for el, lt in zip(elements, letters):
+                m = g[lt].multiplicity if lt in valid else 1
+                counts[el] = counts.get(el, 0) + m
+        except Exception:
+            counts = {}
+            for el in elements:
+                counts[el] = counts.get(el, 0) + 1
+        if not counts:
+            return False
+        comp = Composition(counts)
+        return bool(smact_validity(comp, use_pauling_test=True, include_alloys=True))
+    except Exception:
+        # SMACT 不可用或异常时不阻断生成，视为通过（回退到旧行为）
+        return True
+
+
+def _charge_correct(elements, letters, spg_num, elem_rank_z, topk=5):
+    """
+    电荷修正（方向A·严格版）：只在模型每个位点预测的 top-k 元素里换，
+    先尝试改单个位点，不行再尝试改两个位点的组合，直到 SMACT 通过。
+    - 候选严格来自 elem_rank_z（模型 top-k），不引入模型没预测的元素。
+    - letters/多重度不变，只改元素身份；比例不变，靠换价态匹配的元素凑中性。
+    - 都不行则返回原样，交给下游 SMACT 过滤。
+    """
+    if _smact_ok(elements, letters, spg_num):
+        return elements
+
+    from pymatgen.core import Element as _PmgElement
+    base = list(elements)
+    n = len(base)
+
+    def z2sym(z):
+        try:
+            return _PmgElement.from_Z(int(z)).symbol
+        except Exception:
+            return None
+
+    # 每个位点的候选符号列表（top-k，去掉无法解析的）
+    cand = []
+    for s in range(n):
+        ranks = elem_rank_z[s] if s < len(elem_rank_z) else []
+        syms = []
+        for z in ranks[:topk]:
+            sym = z2sym(z)
+            if sym and sym not in syms:
+                syms.append(sym)
+        cand.append(syms if syms else [base[s]])
+
+    # ---- 深度1：改单个位点 ----
+    for s in range(n):
+        for sym in cand[s]:
+            if sym == base[s]:
+                continue
+            trial = list(base)
+            trial[s] = sym
+            if _smact_ok(trial, letters, spg_num):
+                return trial
+
+    # ---- 深度2：改两个位点 ----
+    for s1 in range(n):
+        for s2 in range(s1 + 1, n):
+            for sym1 in cand[s1]:
+                for sym2 in cand[s2]:
+                    trial = list(base)
+                    trial[s1] = sym1
+                    trial[s2] = sym2
+                    if trial == base:
+                        continue
+                    if _smact_ok(trial, letters, spg_num):
+                        return trial
+
+    # 都不行，返回原样
+    return base
+
+
 class WyckoffDecoder(nn.Module):
     """
     从向量z解码:
@@ -327,6 +418,14 @@ class WyckoffDecoder(nn.Module):
                 elements.append(elem)
                 letters.append(letter)
                 free_params.append(fp)
+
+            # --- 电荷中性修正（方法1·注入点B）---
+            # 用最终一次 forward 的 elem_logits 拿到每个位点的元素概率排序（Z从高到低）
+            _elem_rank_z = []
+            for s in range(n_sites):
+                order = torch.argsort(preds['elem_logits'][i, s], descending=True)
+                _elem_rank_z.append([(int(k) + 1) for k in order[:5].tolist()])  # top5, +1转Z
+            elements = _charge_correct(elements, letters, spg_num, _elem_rank_z)
 
             # 计算展开后的总原子数，用于 _fix_lattice 的动态长度下限
             try:

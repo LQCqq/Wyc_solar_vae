@@ -13,8 +13,8 @@
 #PBS -j oe
 SCRATCH=/srv/scratch/ml4matdis/Quanli_Project/z5561341
 SCRIPTS=$SCRATCH/projectA/cdvae/scripts
-INPUT=$SCRATCH/generated_structures/formal_structure
-OUTPUT=$SCRATCH/SMACT_structure/formal_smact_structure
+INPUT=$SCRATCH/generated_structures/charge_refactor_structure
+OUTPUT=$SCRATCH/SMACT_structure/charge_refactor_structure
 
 cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
