@@ -17,15 +17,18 @@ OUTPUT_CFG0=$SCRATCH/generated_structures/cfg_0
 OUTPUT_CFG2=$SCRATCH/generated_structures/cfg_2
 OUTPUT_CFG4=$SCRATCH/generated_structures/cfg_4
 OUTPUT_test=$SCRATCH/generated_structures/cfg_Oxi
-
+OUTPUT_abstract=$SCRATCH/generated_structures/abstract
+OUTPUT_abstract_uncon=$SCRATCH/generated_structures/abstract_uncon
+OUTPUT_abstract_S=$SCRATCH/generated_structures/abstract_S
 
 cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae2
-python /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts/generate_wyckoff.py \
-   --out_dir $OUTPUT_test \
-   --num_samples 1000 \
-   --target_elements "O" \
-   --cfg_w 2 \
-   --must_contain all
+python /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts/render_diffusion.py \
+   --out_dir $OUTPUT_abstract_S \
+   --ckpt /srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-08-09/test_wyckoff/epoch=102-step=10918.ckpt \
+   --n_candidates 100 \
+   --target_elements "S,Se,Te" --cfg_w 1.0 \
+   --need_target any \
+   --save_steps 100,80,60,20,10
 

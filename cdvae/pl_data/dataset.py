@@ -135,6 +135,21 @@ class CrystDataset(Dataset):
                 ])
                 data.num_wyk_sites = torch.tensor(1)
 
+            # ── CFG 元素条件（对齐论文类别标签语义）──
+            # 条件表示"想要含哪些元素"（生成意图），不是"结构含全部元素"（成分描述）。
+            # 若用全部元素，masked-diffusion 会把 multihot=1 学成"这些已被别处占用"
+            # 从而反向压低目标元素。改为：每个结构随机选 1-2 个真实元素作为目标条件。
+            zs = data.wyk_atom_types.long().view(-1)
+            valid_zs = zs[(zs >= 1) & (zs <= 100)].unique()
+            elem_mh = torch.zeros(100)
+            if valid_zs.numel() > 0:
+                k = 1 if valid_zs.numel() == 1 else int(torch.randint(1, 3, (1,)).item())  # 1或2
+                k = min(k, valid_zs.numel())
+                perm = torch.randperm(valid_zs.numel())[:k]
+                chosen = valid_zs[perm]
+                elem_mh[chosen - 1] = 1.0
+            data.elem_multihot = elem_mh.view(1, 100)  # (1,100) 便于按batch拼接
+
         return data
 
     def __repr__(self) -> str:

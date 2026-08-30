@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#PBS -N Matgl-bandgap-pbe
+
+#PBS -l select=1:ncpus=8:mem=46gb:ngpus=0
+
+#PBS -l walltime=6:00:00
+
+#PBS -M z5561341@ad.unsw.edu.au
+
+#PBS -m ae
+
+#PBS -j oe
+
+
+export PYTHONNOUSERSITE=1
+export PIP_CACHE_DIR=/srv/scratch/z5561341/.pip_cache
+export TMPDIR=/srv/scratch/z5561341/tmp
+export HF_HOME=/srv/scratch/z5561341/.hf_cache
+source /srv/scratch/z5561341/miniconda3/bin/activate
+conda activate /srv/scratch/z5561341/envs/matgl
+CIF_DIR="/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures/test_cif"
+SCRIPT="/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts/predict_bandgap.py"
+cd /srv/scratch/ml4matdis/Quanli_Project/z5561341
+python3 ${SCRIPT} --cif_dir "${CIF_DIR}" --method 0 --pattern "*.cif"

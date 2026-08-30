@@ -17,7 +17,8 @@ source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae2
 #export HYDRA_JOBS=/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra
 TODAY=$(date +%Y-%m-%d)
-OUTDIR="/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-07-24/test_wyckoff"
+OUTDIR="/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/${TODAY}/test_wyckoff"
 mkdir -p ${OUTDIR}
-WYCKOFF_GT_PROBE=1 WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled +train.weights_only_resume=true +train.pl_trainer.enable_progress_bar=false "hydra.run.dir=${OUTDIR}"
+cp /srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-07-24/test_wyckoff/epoch=139-step=14840.ckpt ${OUTDIR}/
+WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled +train.weights_only_resume=true +train.pl_trainer.enable_progress_bar=false "hydra.run.dir=${OUTDIR}"
 #WANDB_API_KEY="" WANDB_MODE=disabled python run.py data=mp_20 model=wyckoff_cdvae expname=test_wyckoff logging.wandb.mode=disabled

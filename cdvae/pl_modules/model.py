@@ -250,6 +250,16 @@ class WyckoffCDVAE(BaseModule):
             per_site_z = z_proj + torch.randn_like(z_proj) * 0.2
         # ────────────────────────────────────────────────────────
 
+        # ── CFG 元素条件（阶段1）：从 batch 取 multi-hot，训练时随机丢弃 ──
+        elem_cond = getattr(batch, 'elem_multihot', None)  # (B,100) 或 None
+        cfg_drop = None
+        if elem_cond is not None:
+            elem_cond = elem_cond.view(-1, 100).to(device)
+            if self.training:
+                # 以概率 p_uncond 丢弃条件：被丢弃的样本在 decoder 里用 null_elem_cond
+                p_uncond = getattr(self.hparams, 'cfg_p_uncond', 0.15)
+                cfg_drop = torch.rand(elem_cond.size(0), device=device) < p_uncond
+
         # decoder：noisy条件 + per-site latent z（训练/生成一致，无shortcut）
         preds = self.decoder(
             z, t=t_batch,
@@ -257,6 +267,8 @@ class WyckoffCDVAE(BaseModule):
             noisy_letter_ids=noisy_letter_ids,
             per_site_z=per_site_z,
             enc_padding_mask=enc_padding_mask,
+            elem_cond=elem_cond,
+            cfg_drop=cfg_drop,
         )
 
         # loss conduct
@@ -495,11 +507,11 @@ class WyckoffCDVAE(BaseModule):
     # Generate
    
     @torch.no_grad()
-    def generate(self, num_samples: int = 10):
+    def generate(self, num_samples: int = 10, elem_cond=None, cfg_w=0.0):
         z = torch.randn(
             num_samples, self.hparams.latent_dim, device=self.device
         )
-        wyckoff_list = self.decoder.decode_to_wyckoff(z)
+        wyckoff_list = self.decoder.decode_to_wyckoff(z, elem_cond=elem_cond, cfg_w=cfg_w)
 
         from cdvae.pl_data.wyckoff_utils import wyckoff_to_structure
         structures = []

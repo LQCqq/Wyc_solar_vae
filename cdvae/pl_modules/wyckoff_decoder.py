@@ -237,8 +237,19 @@ class WyckoffDecoder(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
+        # ── CFG 元素条件（阶段1）：结构级 multi-hot(100) → hidden_dim ──
+        # 训练时注入"该结构含哪些元素"，生成时注入"想要哪些元素(如硫族)"。
+        # null_elem_cond 是可学习的"空条件"，CFG 随机丢弃/无条件分支时使用。
+        self.elem_cond_proj = nn.Sequential(
+            nn.Linear(100, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.null_elem_cond = nn.Parameter(torch.zeros(hidden_dim))
 
-    def forward(self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None, per_site_z=None, enc_padding_mask=None):
+
+    def forward(self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None, per_site_z=None, enc_padding_mask=None, elem_cond=None, cfg_drop=None):
         """
         z: (B, latent_dim)
         Returns dict of predictions (logits)
@@ -282,6 +293,19 @@ class WyckoffDecoder(nn.Module):
             site_feats = site_feats + noisy_letter_feats
         site_feats = self.site_fusion(site_feats)
 
+        # ── CFG 元素条件注入（阶段1）：结构级条件广播到所有位点 ──
+        # elem_cond: (B,100) multi-hot；None 时整批用 null（无条件分支）
+        # cfg_drop: (B,) bool，True 的样本用 null（训练时随机丢弃）
+        B_ = site_feats.size(0)
+        null_feat = self.null_elem_cond.unsqueeze(0).expand(B_, -1)  # (B, D)
+        if elem_cond is not None:
+            cond_feat = self.elem_cond_proj(elem_cond)              # (B, D)
+            if cfg_drop is not None:
+                cond_feat = torch.where(cfg_drop.unsqueeze(1), null_feat, cond_feat)
+        else:
+            cond_feat = null_feat
+        site_feats = site_feats + cond_feat.unsqueeze(1)           # 广播到 (B, max_sites, D)
+
         # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用）
         if per_site_z is not None:
             # 全padding行会让softmax(全-inf)=NaN：临时放开首位，算完还原
@@ -310,9 +334,28 @@ class WyckoffDecoder(nn.Module):
         }
 
     @torch.no_grad()
-    def decode_to_wyckoff(self, z, temperature=0.5):
+    def decode_to_wyckoff(self, z, temperature=0.5, elem_cond=None, cfg_w=0.0):
+        """
+        elem_cond: (B,100) 或 (100,) multi-hot 目标元素集合(如硫族)；None=无条件
+        cfg_w:     classifier-free guidance 强度。0=普通条件(或无条件)，
+                   >0 时对 elem_logits 外推：logits_uncond + (1+cfg_w)*(logits_cond-logits_uncond)
+        """
         B = z.shape[0]
         device = z.device
+
+        # 规整 elem_cond 到 (B,100)
+        if elem_cond is not None:
+            elem_cond = elem_cond.to(device).float().view(-1, 100)
+            if elem_cond.size(0) == 1 and B > 1:
+                elem_cond = elem_cond.expand(B, -1)
+
+        def _elem_logits_cfg(preds_c, preds_u):
+            """CFG 外推（只作用于 elem_logits）。"""
+            if preds_u is None or cfg_w <= 0:
+                return preds_c['elem_logits']
+            lc = preds_c['elem_logits']
+            lu = preds_u['elem_logits']
+            return lu + (1.0 + cfg_w) * (lc - lu)
 
         # 预测SPG
         h_init = self.fc_shared(z)
@@ -355,7 +398,11 @@ class WyckoffDecoder(nn.Module):
         # 去噪：从T到1
         for step in range(self.T, 0, -1):
             t = torch.full((B,), step, dtype=torch.long, device=device)
-            preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z)
+            preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=elem_cond)
+            # CFG：额外跑一次无条件分支并外推 elem_logits
+            if elem_cond is not None and cfg_w > 0:
+                preds_u = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=None)
+                preds['elem_logits'] = _elem_logits_cfg(preds, preds_u)
 
             # 对所有位点采样elem
             elem_probs = torch.softmax(preds['elem_logits'] / temperature, dim=-1)  # (B, S, 100)
@@ -384,7 +431,10 @@ class WyckoffDecoder(nn.Module):
 
     
         t_final = torch.ones(B, dtype=torch.long, device=device)
-        preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z)
+        preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=elem_cond)
+        if elem_cond is not None and cfg_w > 0:
+            preds_u = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=None)
+            preds['elem_logits'] = _elem_logits_cfg(preds, preds_u)
 
         results = []
         for i in range(B):
