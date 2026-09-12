@@ -19,11 +19,27 @@ _target_: cdvae.pl_modules.model.WyckoffCDVAE
 #  num_after_skip: 2
 #  num_output_layers: 3
 
+
+
 # 模型结构
 latent_dim: 512
 hidden_dim: 512
 max_wyckoff_sites: 12   # 每个晶体最多预测的wyckoff位点数
 fc_num_layers: 3
+
+# per-site latent双路径监督
+site_z_encoder_loss_weight: 0.3
+site_z_projector_loss_weight: 0.7
+
+# conditional per-site prior
+site_prior_kl_scale: 0.1
+site_prior_logvar_min: -10.0
+site_prior_logvar_max: 2.0
+
+# Ehull 条件生成（第一阶段：condition，不增加 Ehull loss）
+use_stability_condition: true
+num_stability_classes: 4
+cfg_p_uncond: 0.15
 
 
 # 损失权重

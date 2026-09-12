@@ -66,7 +66,7 @@ def main():
             # SMACT 对某些罕见元素组合(比如稀有气体、超重元素)可能直接报错，
             # 视为不通过处理，不让脚本中断
             valid = False
-            print(f"  [SMACT检查异常，判为不通过] {cif_path.name} ({formula}): {e}")
+            print(f"  [SMACT failed] {cif_path.name} ({formula}): {e}")
 
         results.append({
             "source": cif_path.name,

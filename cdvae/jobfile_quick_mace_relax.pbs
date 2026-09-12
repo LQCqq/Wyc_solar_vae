@@ -13,8 +13,8 @@
 #PBS -j oe
 SCRATCH=/srv/scratch/ml4matdis/Quanli_Project/z5561341
 SCRIPTS=$SCRATCH/projectA/cdvae/scripts
-INPUT=$SCRATCH/generated_structures/cfg_0
-OUTPUT=$SCRATCH/MACE_structure/cfg_0_noSMACT
+INPUT=$SCRATCH/SMACT_structure/formal_smact_structure
+OUTPUT=$SCRATCH/MACE_structure/formal_mace_structure
 INPUT_test=$SCRATCH/generated_structures/mytest
 
 cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
@@ -22,7 +22,7 @@ source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate mace
 export LD_LIBRARY_PATH=/srv/scratch/z5561341/miniconda3/envs/mace/lib:$LD_LIBRARY_PATH
 python $SCRIPTS/mace_relax.py \
-    --input_dir  $INPUT_test  \
+    --input_dir  $INPUT \
     --output_dir $OUTPUT \
     --device     cuda    \
     --mace_model medium-mpa-0  \

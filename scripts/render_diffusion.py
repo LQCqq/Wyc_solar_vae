@@ -103,7 +103,7 @@ def assemble_structure(spg_num, noisy_elem_ids_i, noisy_letter_ids_i,
     except Exception:
         _n_atoms = n_sites * 2
     lat_arr = _fix_lattice(lattice_pred_i * np.array([10., 10., 10., 90., 90., 90.]),
-                           n_atoms=_n_atoms)
+                           n_atoms=_n_atoms, spg_num=spg_num)
 
     if expand:
         # 完整展开成晶体（最终帧）
@@ -144,8 +144,11 @@ def run_one_trajectory(model, dec, device, seed, elem_cond, cfg_w, temperature,
             return pc['elem_logits']
         return pu['elem_logits'] + (1.0 + cfg_w) * (pc['elem_logits'] - pu['elem_logits'])
 
-    h_init = dec.fc_shared(z)
-    spg_nums = dec.spg_head(h_init).argmax(-1) + 1
+    h_init, spg_logits_init, lattice_pred_init, num_sites_logits_init = dec.global_predictions(z)
+    global_state = (h_init, spg_logits_init, lattice_pred_init, num_sites_logits_init)
+    spg_nums = spg_logits_init.argmax(-1) + 1
+    n_sites = dec._initial_num_sites(spg_nums, num_sites_logits_init)
+    site_padding_mask = torch.arange(dec.max_sites, device=device).unsqueeze(0) >= n_sites.unsqueeze(1)
 
     def build_mask(spg_num, num_letters):
         try:
@@ -162,7 +165,7 @@ def run_one_trajectory(model, dec, device, seed, elem_cond, cfg_w, temperature,
             return torch.ones(num_letters, device=device)
 
     letter_masks = torch.stack([build_mask(spg_nums[b].item(), dec.num_letters) for b in range(B)])
-    z_proj = dec.site_z_projector(z).unsqueeze(1).expand(B, dec.max_sites, -1)
+    z_proj = dec.build_site_z(z)
     per_site_z = z_proj + torch.randn_like(z_proj) * 0.2
 
     noisy_elem_ids = torch.zeros(B, dec.max_sites, dtype=torch.long, device=device)
@@ -173,14 +176,14 @@ def run_one_trajectory(model, dec, device, seed, elem_cond, cfg_w, temperature,
     snapshots = {}  # step -> (struct, elements)
 
     def snapshot(step, preds, expand=False):
-        n_sites = preds['num_sites_logits'][i].argmax().item() + 1
+        n_sites_i = int(n_sites[i].item())
         fp = preds['free_params'][i].cpu().numpy()
-        lat = preds['lattice_pred'][i].cpu().numpy()
+        lat = lattice_pred_init[i].cpu().numpy()
         try:
             struct, elems = assemble_structure(spg_num, noisy_elem_ids[i], noisy_letter_ids[i],
-                                               fp, lat, n_sites, placeholder_Z, expand=expand)
-            snapshots[step] = (struct, elems, n_sites,
-                               sum(1 for s in range(n_sites) if int(noisy_elem_ids[i, s].item()) == 0))
+                                               fp, lat, n_sites_i, placeholder_Z, expand=expand)
+            snapshots[step] = (struct, elems, n_sites_i,
+                               sum(1 for s in range(n_sites_i) if int(noisy_elem_ids[i, s].item()) == 0))
         except Exception as e:
             snapshots[step] = (None, None, 0, 0)
 
@@ -188,7 +191,9 @@ def run_one_trajectory(model, dec, device, seed, elem_cond, cfg_w, temperature,
     with torch.no_grad():
         t_full = torch.full((B,), dec.T, dtype=torch.long, device=device)
         preds0 = dec.forward(z, t=t_full, noisy_elem_ids=noisy_elem_ids,
-                             noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=ec)
+                             noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z,
+                             enc_padding_mask=site_padding_mask, site_padding_mask=site_padding_mask,
+                             elem_cond=ec, lattice_spg=spg_nums, global_state=global_state)
         last_preds = preds0
         if dec.T in save_steps:
             snapshot(dec.T, preds0, expand=False)  # 位点级(不展开)
@@ -196,10 +201,14 @@ def run_one_trajectory(model, dec, device, seed, elem_cond, cfg_w, temperature,
         for step in range(dec.T, 0, -1):
             t = torch.full((B,), step, dtype=torch.long, device=device)
             preds = dec.forward(z, t=t, noisy_elem_ids=noisy_elem_ids,
-                                noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=ec)
+                                noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z,
+                                enc_padding_mask=site_padding_mask, site_padding_mask=site_padding_mask,
+                                elem_cond=ec, lattice_spg=spg_nums, global_state=global_state)
             if ec is not None and cfg_w > 0:
                 preds_u = dec.forward(z, t=t, noisy_elem_ids=noisy_elem_ids,
-                                      noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=None)
+                                      noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z,
+                                      enc_padding_mask=site_padding_mask, site_padding_mask=site_padding_mask,
+                                      elem_cond=None, lattice_spg=spg_nums, global_state=global_state)
                 preds['elem_logits'] = _cfg(preds, preds_u)
             last_preds = preds
 
@@ -216,12 +225,32 @@ def run_one_trajectory(model, dec, device, seed, elem_cond, cfg_w, temperature,
             unmask_prob = 1.0 / step
             should_unmask = torch.rand(B, dec.max_sites, device=device) < unmask_prob
             still_masked = (noisy_elem_ids == 0)
-            update = still_masked & should_unmask
+            update = still_masked & should_unmask & ~site_padding_mask
             noisy_elem_ids = torch.where(update, sampled_elems, noisy_elem_ids)
             noisy_letter_ids = torch.where(update, sampled_letters, noisy_letter_ids)
 
             if (step - 1) in save_steps:
                 snapshot(step - 1, preds, expand=False)  # 位点级(不展开)
+
+        t_final = torch.ones(B, dtype=torch.long, device=device)
+        last_preds = dec.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids,
+                                 noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z,
+                                 enc_padding_mask=site_padding_mask, site_padding_mask=site_padding_mask,
+                                 elem_cond=ec, lattice_spg=spg_nums, global_state=global_state)
+        noisy_letter_ids, n_sites = dec._constrain_final_letters(
+            last_preds['letter_logits'], noisy_letter_ids, spg_nums, n_sites
+        )
+        site_padding_mask = torch.arange(dec.max_sites, device=device).unsqueeze(0) >= n_sites.unsqueeze(1)
+        last_preds = dec.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids,
+                                 noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z,
+                                 enc_padding_mask=site_padding_mask, site_padding_mask=site_padding_mask,
+                                 elem_cond=ec, lattice_spg=spg_nums, global_state=global_state)
+        if ec is not None and cfg_w > 0:
+            preds_u = dec.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids,
+                                  noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z,
+                                  enc_padding_mask=site_padding_mask, site_padding_mask=site_padding_mask,
+                                  elem_cond=None, lattice_spg=spg_nums, global_state=global_state)
+            last_preds['elem_logits'] = _cfg(last_preds, preds_u)
 
         # 额外一帧：位点全确定后，按 Wyckoff 对称展开成完整晶体
         snapshot('expanded', last_preds, expand=True)

@@ -32,13 +32,64 @@ class CrystDataset(Dataset):
         self.graph_method = graph_method
         self.lattice_scale_method = lattice_scale_method
 
+        # Ehull 条件标签。默认边界适用于标准 MP-20 的低 Ehull 范围：
+        # class 0: Ehull <= 0
+        # class 1: 0 < Ehull <= 0.01
+        # class 2: 0.01 < Ehull <= 0.03
+        # class 3: Ehull > 0.03
+        # 如实际 train.csv 分布不同，可在 data yaml 中传入 ehull_bin_edges。
+        self.use_ehull_condition = kwargs.get(
+            'use_ehull_condition', 'e_above_hull' in self.df.columns
+        )
+        self.ehull_column = kwargs.get('ehull_column', 'e_above_hull')
+        self.ehull_bin_edges = tuple(
+            float(x) for x in kwargs.get('ehull_bin_edges', [0.0, 0.01, 0.03])
+        )
+        if len(self.ehull_bin_edges) != 3:
+            raise ValueError(
+                'ehull_bin_edges must contain exactly 3 values for 4 classes.'
+            )
+        if tuple(sorted(self.ehull_bin_edges)) != self.ehull_bin_edges:
+            raise ValueError('ehull_bin_edges must be sorted in ascending order.')
+        if self.use_ehull_condition:
+            if self.ehull_column not in self.df.columns:
+                raise KeyError(
+                    f'Missing required Ehull column: {self.ehull_column!r}'
+                )
+            ehull_values = pd.to_numeric(
+                self.df[self.ehull_column], errors='coerce'
+            )
+            if ehull_values.isna().any():
+                bad_count = int(ehull_values.isna().sum())
+                raise ValueError(
+                    f'{bad_count} rows have missing/invalid {self.ehull_column} values.'
+                )
+            self.ehull_values = ehull_values.astype(float).to_numpy()
+            class_counts = [0, 0, 0, 0]
+            for value in self.ehull_values:
+                class_id = sum(
+                    float(value) > edge for edge in self.ehull_bin_edges
+                )
+                class_counts[class_id] += 1
+            print(
+                f'[Ehull] column={self.ehull_column} '
+                f'edges={self.ehull_bin_edges} class_counts={class_counts}'
+            )
+        else:
+            self.ehull_values = None
+
+        preprocess_props = [prop]
+        if (self.use_ehull_condition and
+                self.ehull_column not in preprocess_props):
+            preprocess_props.append(self.ehull_column)
+
         self.cached_data = preprocess(
             self.path,
             preprocess_workers,
             niggli=self.niggli,
             primitive=self.primitive,
             graph_method=self.graph_method,
-            prop_list=[prop])
+            prop_list=preprocess_props)
 
         add_scaled_lattice_prop(self.cached_data, lattice_scale_method)
         self.lattice_scaler = None
@@ -111,6 +162,20 @@ class CrystDataset(Dataset):
             num_nodes=num_atoms,
             y=prop.view(1, -1),
         )
+
+        # Ehull 只作为生成条件，不替换 batch.y，也不在本阶段增加 Ehull loss。
+        # 使用 “> edge” 可让 Ehull == 0 单独落入最低类别 class 0。
+        if self.use_ehull_condition:
+            e_above_hull = float(data_dict[self.ehull_column])
+            stability_class = sum(
+                e_above_hull > edge for edge in self.ehull_bin_edges
+            )
+            data.e_above_hull = torch.tensor(
+                [e_above_hull], dtype=torch.float32
+            )
+            data.stability_class = torch.tensor(
+                [stability_class], dtype=torch.long
+            )
 
         if self.use_wyckoff:
             wyk = self.wyckoff_cache.get(index)

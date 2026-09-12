@@ -140,7 +140,6 @@ class WyckoffCDVAE(BaseModule):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        # encoder: wyckoffEmbedding 替换原始DimeNet GNN
         self.encoder = WyckoffEmbedding(
             hidden_dim=self.hparams.hidden_dim,
             latent_dim=self.hparams.latent_dim,
@@ -152,6 +151,12 @@ class WyckoffCDVAE(BaseModule):
             latent_dim=self.hparams.latent_dim,
             hidden_dim=self.hparams.hidden_dim,
             max_sites=self.hparams.max_wyckoff_sites,
+            max_atoms=self.hparams.max_atoms,
+            num_stability_classes=getattr(
+                self.hparams, 'num_stability_classes', 4
+            ),
+            site_prior_logvar_min=getattr(self.hparams, 'site_prior_logvar_min', -10.0),
+            site_prior_logvar_max=getattr(self.hparams, 'site_prior_logvar_max', 2.0),
         )
 
         # loss
@@ -164,6 +169,10 @@ class WyckoffCDVAE(BaseModule):
             w_nsites=getattr(self.hparams, 'w_nsites', 0.5),
             w_overlap=getattr(self.hparams, 'w_overlap', 0.0),
             w_charge=getattr(self.hparams, 'w_charge', 0.0),
+            max_atoms=self.hparams.max_atoms,
+            overlap_margin=getattr(self.hparams, 'overlap_margin', 0.05),
+            overlap_tau=getattr(self.hparams, 'overlap_tau', 1.0),
+            overlap_spg_topk=getattr(self.hparams, 'overlap_spg_topk', 3),
         )
 
         # diffusion步数
@@ -208,12 +217,8 @@ class WyckoffCDVAE(BaseModule):
         # 将flat elem_mask转换为(B, max_sites)格式，用于loss加权和noisy输入
         S = self.decoder.max_sites
         masked_sites = torch.zeros(B, S, dtype=torch.bool, device=device)
-        # _prepare_targets(在本函数201行已调用)已将batch.num_wyk_sites修正为
-        # 正确的(B,)long张量(GPU,纯拷贝得到，值正确)。site_batch_idx=repeat_interleave
-        # 产出的是单调不减序列，即每个结构i的位点在flat张量中是连续一段——
-        # 用offset连续切片(与wyckoff_encoder.py一致，已验证可用)，避免
-        # bool mask索引(tensor[bool_mask][:n])在训练(梯度跟踪)模式下触发
-        # "Expected !is_symbolic()"内部错误(验证模式下不触发，但训练时会)。
+    
+
         num_sites_cpu = batch.num_wyk_sites.cpu()
         offset = 0
         for i in range(B):
@@ -240,49 +245,110 @@ class WyckoffCDVAE(BaseModule):
         ).clamp(-10.0, 2.0)
         per_site_mu = torch.nan_to_num(per_site_mu, nan=0.0, posinf=1e4, neginf=-1e4)
         eps_site = torch.randn_like(per_site_mu)
-        per_site_z = per_site_mu + eps_site * torch.exp(0.5 * per_site_log_var)
+        encoder_per_site_z = per_site_mu + eps_site * torch.exp(0.5 * per_site_log_var)
 
-        # ── scheduled sampling：30%概率用projector替换encoder的per_site_z ──
-        # 训练site_z_projector，弥合训练/生成的分布差距
-        if self.training and torch.rand(1, device=device).item() < 0.3:
-            z_proj = self.decoder.site_z_projector(z)
-            z_proj = z_proj.unsqueeze(1).expand_as(per_site_z)
-            per_site_z = z_proj + torch.randn_like(z_proj) * 0.2
-        # ────────────────────────────────────────────────────────
-
-        # ── CFG 元素条件（阶段1）：从 batch 取 multi-hot，训练时随机丢弃 ──
+        # ── 联合CFG条件：元素意图 + Ehull稳定性类别 ──
         elem_cond = getattr(batch, 'elem_multihot', None)  # (B,100) 或 None
-        cfg_drop = None
         if elem_cond is not None:
             elem_cond = elem_cond.view(-1, 100).to(device)
-            if self.training:
-                # 以概率 p_uncond 丢弃条件：被丢弃的样本在 decoder 里用 null_elem_cond
-                p_uncond = getattr(self.hparams, 'cfg_p_uncond', 0.15)
-                cfg_drop = torch.rand(elem_cond.size(0), device=device) < p_uncond
 
-        # decoder：noisy条件 + per-site latent z（训练/生成一致，无shortcut）
-        preds = self.decoder(
+        stability_cond = None
+        if getattr(self.hparams, 'use_stability_condition', False):
+            if not hasattr(batch, 'stability_class'):
+                raise AttributeError(
+                    'use_stability_condition=true, but batch.stability_class is missing. '
+                    'Use the modified dataset.py and an MP-20 CSV containing e_above_hull.'
+                )
+            stability_cond = batch.stability_class.view(-1).long().to(device)
+
+        cfg_drop = None
+        if self.training and (elem_cond is not None or stability_cond is not None):
+            # 同一行同时丢弃元素和稳定性条件，训练真正的联合无条件分支。
+            p_uncond = getattr(self.hparams, 'cfg_p_uncond', 0.15)
+            cfg_drop = torch.rand(B, device=device) < p_uncond
+
+        # ── 双路径监督：conditional site prior 与生成路径完全一致 ──
+        projector_per_site_z, site_prior_mu, site_prior_log_var = (
+            self.decoder.sample_site_prior(
+                z,
+                stability_cond=stability_cond,
+                cfg_drop=cfg_drop,
+            )
+        )
+
+        # decoder：noisy条件 + per-site latent z（双路径共享除per_site_z外的所有输入）
+        preds_encoder = self.decoder(
             z, t=t_batch,
             noisy_elem_ids=noisy_elem_ids,
             noisy_letter_ids=noisy_letter_ids,
-            per_site_z=per_site_z,
+            per_site_z=encoder_per_site_z,
             enc_padding_mask=enc_padding_mask,
+            site_padding_mask=enc_padding_mask,
             elem_cond=elem_cond,
+            stability_cond=stability_cond,
             cfg_drop=cfg_drop,
+            lattice_spg=targets['spg_target'] + 1,
+        )
+
+        preds_projector = self.decoder(
+            z, t=t_batch,
+            noisy_elem_ids=noisy_elem_ids,
+            noisy_letter_ids=noisy_letter_ids,
+            per_site_z=projector_per_site_z,
+            enc_padding_mask=enc_padding_mask,
+            site_padding_mask=enc_padding_mask,
+            elem_cond=elem_cond,
+            stability_cond=stability_cond,
+            cfg_drop=cfg_drop,
+            lattice_spg=targets['spg_target'] + 1,
         )
 
         # loss conduct
-        recon_loss, loss_dict = self.recon_loss(preds, targets, site_mask, masked_sites=masked_sites)
+        recon_loss_encoder, loss_dict_encoder = self.recon_loss(
+            preds_encoder, targets, site_mask, masked_sites=masked_sites
+        )
+        recon_loss_projector, loss_dict_projector = self.recon_loss(
+            preds_projector, targets, site_mask, masked_sites=masked_sites
+        )
+        encoder_loss_weight = max(
+            float(getattr(self.hparams, 'site_z_encoder_loss_weight', 0.3)), 0.0
+        )
+        projector_loss_weight = max(
+            float(getattr(self.hparams, 'site_z_projector_loss_weight', 0.7)), 0.0
+        )
+        path_weight_sum = max(encoder_loss_weight + projector_loss_weight, 1e-8)
+        encoder_loss_weight /= path_weight_sum
+        projector_loss_weight /= path_weight_sum
+        recon_loss = (
+            encoder_loss_weight * recon_loss_encoder
+            + projector_loss_weight * recon_loss_projector
+        )
+        loss_dict = {
+            key: (
+                encoder_loss_weight * loss_dict_encoder[key]
+                + projector_loss_weight * loss_dict_projector[key]
+            )
+            for key in loss_dict_encoder
+        }
+        loss_dict.update({
+            f'encoder_{key}': value for key, value in loss_dict_encoder.items()
+        })
+        loss_dict.update({
+            f'projector_{key}': value for key, value in loss_dict_projector.items()
+        })
 
         # Global KL
         kld_loss = self.kld_loss(mu, log_var)
 
-        # Per-site KL（只对valid sites计算）
+        # Per-site conditional KL（只对valid sites计算）
         site_valid = ~enc_padding_mask  # (B, max_sites), True=valid
-        # per_site_log_var 同样需要 clamp，防止 exp() 溢出产生 NaN（与 kld_loss 的 log_var 同理）
-        per_site_log_var = per_site_log_var.clamp(-10, 2)
-        kld_site = -0.5 * (1 + per_site_log_var - per_site_mu.pow(2) - per_site_log_var.exp())
-        kld_site = (kld_site * site_valid.unsqueeze(-1).float()).sum() / site_valid.float().sum().clamp(min=1)
+        kld_site = self.conditional_site_kld(
+            per_site_mu,
+            per_site_log_var,
+            site_prior_mu,
+            site_prior_log_var,
+            site_valid,
+        )
 
         if self.hparams.predict_property and hasattr(batch, 'y'):
             property_loss = F.mse_loss(self.fc_property(z).squeeze(-1), batch.y)
@@ -291,8 +357,6 @@ class WyckoffCDVAE(BaseModule):
 
         # sm_90 修复：kld_loss/kld_site/property_loss 是 loss_dict 里仅剩的
         # 未经处理的原始 GPU tensor（仍带 grad_fn）。异步 CUDA 执行在 sm_90 上
-        # 会让 isnan() 检查读到尚未落定的瞬时垃圾值（表现为 training_step 里
-        # 反复标记这三者异常，但稍后 .item() 读回来又是正常数）。
         # 用 nan_to_num 立即处理：既强制同步，又清除真实的 NaN/Inf，
         # 且保留 grad_fn（不 detach），不影响反向传播。
         kld_loss = torch.nan_to_num(kld_loss, nan=0.0, posinf=0.0, neginf=0.0)
@@ -300,16 +364,35 @@ class WyckoffCDVAE(BaseModule):
         property_loss = torch.nan_to_num(property_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         # total loss
+        regularization_loss = (
+            self.hparams.beta * kld_loss
+            + self.hparams.beta * getattr(self.hparams, 'site_prior_kl_scale', 0.1) * kld_site
+            + self.hparams.cost_property * property_loss
+        )
         total_loss = (
             recon_loss
+            + regularization_loss
+        )
+        encoder_total_loss = (
+            recon_loss_encoder
+            + regularization_loss
+        )
+        projector_total_loss = (
+            recon_loss_projector
             + self.hparams.beta * kld_loss
-            + self.hparams.beta * 0.1 * kld_site
             + self.hparams.cost_property * property_loss
         )
 
         loss_dict.update({
+            'encoder_recon_loss': recon_loss_encoder,
+            'projector_recon_loss': recon_loss_projector,
+            'combined_recon_loss': recon_loss,
+            'encoder_total_loss': encoder_total_loss,
+            'projector_total_loss': projector_total_loss,
             'kld_loss': kld_loss,
             'kld_site': kld_site,
+            'kld_site_conditional': kld_site,
+            'site_prior_std': torch.exp(0.5 * site_prior_log_var).mean(),
             'property_loss': property_loss,
         })
         return total_loss, loss_dict
@@ -319,14 +402,6 @@ class WyckoffCDVAE(BaseModule):
         S = self.decoder.max_sites
         device = batch.num_wyk_sites.device
 
-        # ─── 全部 batch.* 字段统一走 CPU 链路 ────────────────────────────────
-        # 已知问题：nan_to_num / clamp / .long() 等操作在本机(H200/sm_90)GPU
-        # 上不稳定，会产出垃圾值或NaN。num_wyk_sites 此前已修；这里对剩余所有
-        # 未防护的字段补齐同款处理：先 .cpu()，在CPU上做数值清洗，再 .to(device)
-        # 纯拷贝。每个字段的 nan_to_num 兜底值选取原则：
-        #   - 整数索引(spg/elem/letter)：nan→0, 再clamp到合法范围，.long()
-        #   - 浮点坐标(lattice/free)   ：nan/inf→0.0，不额外clamp(保留数据集原值)
-        # num_wyk_sites_cpu留作下方 num_sites_target 复用。
         num_wyk_sites_cpu = (
             batch.num_wyk_sites.cpu().view(-1)
             .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
@@ -394,7 +469,7 @@ class WyckoffCDVAE(BaseModule):
             cnt = int(num_wyk_sites_cpu[i].item())
             n   = min(cnt, S)
             if n > 0:
-                elem_target[i,   :n]    = atom_types_cpu[offset:offset + n].to(device)
+                elem_target[i,   :n]    = (atom_types_cpu[offset:offset + n] - 1).to(device)
                 letter_target[i, :n]    = letters_cpu[offset:offset + n].to(device)
                 free_target[i,   :n, :] = free_cpu[offset:offset + n].to(device)
                 if multi_cpu is not None:
@@ -425,6 +500,38 @@ class WyckoffCDVAE(BaseModule):
         return torch.mean(
             -0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1)
         )
+
+    @staticmethod
+    def conditional_site_kld(
+        posterior_mu,
+        posterior_log_var,
+        prior_mu,
+        prior_log_var,
+        site_valid,
+    ):
+        posterior_mu = torch.nan_to_num(
+            posterior_mu, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        prior_mu = torch.nan_to_num(
+            prior_mu, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        posterior_log_var = torch.nan_to_num(
+            posterior_log_var, nan=-10.0, posinf=2.0, neginf=-10.0
+        ).clamp(-10.0, 2.0)
+        prior_log_var = torch.nan_to_num(
+            prior_log_var, nan=-10.0, posinf=2.0, neginf=-10.0
+        ).clamp(-10.0, 2.0)
+        kld = 0.5 * (
+            prior_log_var
+            - posterior_log_var
+            + (
+                posterior_log_var.exp()
+                + (posterior_mu - prior_mu).pow(2)
+            ) / prior_log_var.exp().clamp(min=1e-8)
+            - 1.0
+        )
+        site_valid = site_valid.unsqueeze(-1).to(kld.dtype)
+        return (kld * site_valid).sum() / site_valid.sum().clamp(min=1.0)
 
    
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
@@ -480,38 +587,58 @@ class WyckoffCDVAE(BaseModule):
 
     def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
+        projector_total_loss = loss_dict.get('projector_total_loss', total_loss)
         # 同样加保障 + 诊断打印：val_loss 若为 NaN 会导致 EarlyStopping 行为异常
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
+        if (torch.isnan(total_loss) or torch.isinf(total_loss)
+                or torch.isnan(projector_total_loss) or torch.isinf(projector_total_loss)):
             bad_keys = {k: v for k, v in loss_dict.items()
                         if (torch.is_tensor(v) and (torch.isnan(v).any() or torch.isinf(v).any()))
                         or (isinstance(v, float) and (v != v or abs(v) == float('inf')))}
             print(f"[NaN警告][val step{batch_idx}] total_loss={total_loss.item()} "
+                  f"projector_total_loss={projector_total_loss.item()} "
                   f"→ 已被nan_to_num替换为0。异常来源字段: {list(bad_keys.keys())}", flush=True)
         total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        projector_total_loss = torch.nan_to_num(
+            projector_total_loss, nan=0.0, posinf=0.0, neginf=0.0
+        )
         log_dict = {f'val_{k}': (v.detach() if torch.is_tensor(v) else v) for k, v in loss_dict.items()}
-        log_dict['val_loss'] = total_loss.detach()
+        log_dict['val_combined_loss'] = total_loss.detach()
+        log_dict['val_loss'] = projector_total_loss.detach()
         self.log_dict(log_dict, on_step=False, on_epoch=True, prog_bar=True)
-        return total_loss
+        return projector_total_loss
 
     def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         total_loss, loss_dict = self(batch)
+        projector_total_loss = loss_dict.get('projector_total_loss', total_loss)
         # 与 training_step / validation_step 保持一致：total_loss 也做 NaN 防护
         # 之前缺了这一层，导致 checkpoint 权重退化时 test 结果直接暴露裸 nan
         total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        projector_total_loss = torch.nan_to_num(
+            projector_total_loss, nan=0.0, posinf=0.0, neginf=0.0
+        )
         log_dict = {f'test_{k}': (v.item() if torch.is_tensor(v) else v)
                     for k, v in loss_dict.items()}
-        log_dict['test_loss'] = total_loss.item()
+        log_dict['test_combined_loss'] = total_loss.item()
+        log_dict['test_loss'] = projector_total_loss.item()
         self.log_dict(log_dict)
-        return total_loss
+        return projector_total_loss
 
     # Generate
    
     @torch.no_grad()
-    def generate(self, num_samples: int = 10, elem_cond=None, cfg_w=0.0):
+    def generate(
+        self, num_samples: int = 10, elem_cond=None,
+        stability_cond=None, cfg_w=0.0,
+    ):
         z = torch.randn(
             num_samples, self.hparams.latent_dim, device=self.device
         )
-        wyckoff_list = self.decoder.decode_to_wyckoff(z, elem_cond=elem_cond, cfg_w=cfg_w)
+        wyckoff_list = self.decoder.decode_to_wyckoff(
+            z,
+            elem_cond=elem_cond,
+            stability_cond=stability_cond,
+            cfg_w=cfg_w,
+        )
 
         from cdvae.pl_data.wyckoff_utils import wyckoff_to_structure
         structures = []
@@ -523,6 +650,8 @@ class WyckoffCDVAE(BaseModule):
                     w['site_letters'],
                     w['site_free_params'],
                     w['lattice_params'],
+                    max_atoms=self.hparams.max_atoms,
+                    distance_margin=self.recon_loss.overlap_margin,
                 )
                 structures.append(struct)
             except Exception as e:

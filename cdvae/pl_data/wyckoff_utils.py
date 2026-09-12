@@ -1,6 +1,8 @@
 # cdvae/pl_data/wyckoff_utils.py
 import numpy as np
 import torch
+import json
+from pathlib import Path
 from pyxtal import pyxtal
 from pymatgen.core import Structure, Element
 from pyxtal.symmetry import Group
@@ -8,6 +10,18 @@ from pyxtal.symmetry import Group
 WYCKOFF_LETTERS = list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
 LETTER_TO_IDX = {l: i for i, l in enumerate(WYCKOFF_LETTERS)}
 MAX_WYCKOFF_SITES = 27
+_ATOMIC_RADII = None
+
+
+def _get_atomic_radii():
+    global _ATOMIC_RADII
+    if _ATOMIC_RADII is None:
+        with open(Path(__file__).parent / 'atomic_radii.json') as f:
+            raw = json.load(f)
+        _ATOMIC_RADII = np.zeros(101, dtype=np.float64)
+        for z_str, info in raw.items():
+            _ATOMIC_RADII[int(z_str)] = float(info['radius_A'])
+    return _ATOMIC_RADII
 
 
 def structure_to_wyckoff(structure: Structure, tol: float = 0.1):
@@ -23,10 +37,10 @@ def structure_to_wyckoff(structure: Structure, tol: float = 0.1):
         raise RuntimeError(f"PyXtal failed at all tolerances: {last_err}")
 
     spg_num = crystal.group.number
-    lattice_params = np.array([
-        crystal.lattice.a, crystal.lattice.b, crystal.lattice.c,
-        crystal.lattice.alpha, crystal.lattice.beta, crystal.lattice.gamma,
-    ], dtype=np.float32)
+    lattice_params = np.array(
+        crystal.lattice.get_para(degree=True),
+        dtype=np.float32,
+    )
 
     site_elements, site_letters, site_multiplicities, site_free_params = [], [], [], []
     for site in crystal.atom_sites:
@@ -92,6 +106,23 @@ import collections as _collections
 W2S_PATH_COUNTER = _collections.Counter()
 W2S_ERROR_SAMPLES = _collections.defaultdict(list)
 W2S_BAD_LETTERS = []  # 记录非法 (spg, letter, 错误类型)
+W2S_FAILURE_PATHS = (
+    'invalid_space_group',
+    'invalid_letter',
+    'duplicate_fixed_orbit',
+    'atom_budget',
+    'atom_count_mismatch',
+    'overlap_before_scaling',
+    'overlap_after_scaling',
+    'site_projection_failure',
+    'lattice_build_error',
+)
+W2S_OVERLAP_DIAGNOSTICS = (
+    'overlap_intra_orbit',
+    'overlap_inter_orbit',
+    'exact_duplicate',
+    'close_contact',
+)
 
 def _w2s_log(path, err=None):
     W2S_PATH_COUNTER[path] += 1
@@ -100,13 +131,25 @@ def _w2s_log(path, err=None):
 
 def w2s_report():
     print("\n===== wyckoff_to_structure 路径统计 =====")
-    total = sum(v for k,v in W2S_PATH_COUNTER.items() if k in
-                ['尝试1_ops投影','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None'])
-    for path in ['尝试1_ops投影','尝试2_pyxtal_build','尝试3_random+晶格','尝试4_全随机','返回None']:
-        n = W2S_PATH_COUNTER.get(path, 0)
-        print(f"  {path:20s}: {n:4d} ({100*n/total if total else 0:5.1f}%)")
+    success = W2S_PATH_COUNTER.get('尝试1_ops投影手动', 0)
+    failed = sum(W2S_PATH_COUNTER.get(path, 0) for path in W2S_FAILURE_PATHS)
+    total = success + failed
+    print(f"  {'success':24s}: {success:4d} ({100*success/total if total else 0:5.1f}%)")
+    print(f"  {'failed':24s}: {failed:4d} ({100*failed/total if total else 0:5.1f}%)")
     print(f"  {'总计':20s}: {total}")
-    for path in ['尝试1_ops投影手动']:
+    print("\n  失败原因:")
+    for path in W2S_FAILURE_PATHS:
+        n = W2S_PATH_COUNTER.get(path, 0)
+        print(f"  {path:24s}: {n:4d} ({100*n/total if total else 0:5.1f}%)")
+    overlap_failed = (
+        W2S_PATH_COUNTER.get('overlap_before_scaling', 0)
+        + W2S_PATH_COUNTER.get('overlap_after_scaling', 0)
+    )
+    print("\n  overlap 诊断 (同一结构可同时计入多项):")
+    for path in W2S_OVERLAP_DIAGNOSTICS:
+        n = W2S_PATH_COUNTER.get(path, 0)
+        print(f"  {path:24s}: {n:4d} ({100*n/overlap_failed if overlap_failed else 0:5.1f}%)")
+    for path in W2S_FAILURE_PATHS:
         if W2S_ERROR_SAMPLES[path]:
             print(f"\n  [{path}] 整体失败错误样本:")
             for e in W2S_ERROR_SAMPLES[path]:
@@ -116,7 +159,8 @@ def w2s_report():
 
 
 def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
-                          site_free_params, lattice_params):
+                          site_free_params, lattice_params, max_atoms=20,
+                          distance_margin=0.05):
   
     from pymatgen.core import Lattice, Structure
 
@@ -126,7 +170,55 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
         lp = np.array(lattice_params)
     a, b, c, alpha, beta, gamma = [float(x) for x in lp]
 
-    g = Group(spacegroup_num)
+    try:
+        g = Group(spacegroup_num)
+    except Exception as e:
+        _w2s_log('invalid_space_group', e)
+        return None
+    valid_wp = {wp.letter: wp for wp in g.Wyckoff_positions}
+    expected_atoms = 0
+    used_fixed_letters = set()
+    for letter in site_letters:
+        if letter not in valid_wp:
+            _w2s_log('invalid_letter')
+            return None
+        wp = valid_wp[letter]
+        if int(wp.get_dof()) == 0:
+            if letter in used_fixed_letters:
+                _w2s_log('duplicate_fixed_orbit')
+                return None
+            used_fixed_letters.add(letter)
+        expected_atoms += int(wp.multiplicity)
+    if expected_atoms < 1 or expected_atoms > int(max_atoms):
+        _w2s_log('atom_budget')
+        return None
+
+    def _validated(result, orbit_ids=None, record_overlap=False):
+        if result is None or len(result) != expected_atoms:
+            return None
+        if len(result) > 1:
+            dm = result.distance_matrix.copy()
+            zs = np.array([int(site.specie.Z) for site in result], dtype=np.int64)
+            radii = _get_atomic_radii()[zs]
+            threshold = (0.7 + radii[:, None] + radii[None, :]) * 0.5
+            threshold = np.maximum(threshold + float(distance_margin), 0.5)
+            np.fill_diagonal(dm, np.inf)
+            overlap_mask = np.triu(dm < threshold, k=1)
+            if np.any(overlap_mask):
+                if record_overlap:
+                    if orbit_ids is not None and len(orbit_ids) == len(result):
+                        orbit_ids = np.asarray(orbit_ids, dtype=np.int64)
+                        same_orbit = orbit_ids[:, None] == orbit_ids[None, :]
+                        if np.any(overlap_mask & same_orbit):
+                            W2S_PATH_COUNTER['overlap_intra_orbit'] += 1
+                        if np.any(overlap_mask & ~same_orbit):
+                            W2S_PATH_COUNTER['overlap_inter_orbit'] += 1
+                    if np.any(overlap_mask & (dm < 1e-3)):
+                        W2S_PATH_COUNTER['exact_duplicate'] += 1
+                    if np.any(overlap_mask & (dm >= 1e-3)):
+                        W2S_PATH_COUNTER['close_contact'] += 1
+                return None
+        return result
 
     # 预处理：每个site的 (elem, letter, 预测坐标)
     sites_info = []
@@ -139,9 +231,9 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
     try:
         lattice = Lattice.from_parameters(a, b, c, alpha, beta, gamma)
         valid_letters = set(wp.letter for wp in g.Wyckoff_positions)
-        all_sp, all_co = [], []
+        all_sp, all_co, all_orbit_ids = [], [], []
         n_skip = 0
-        for elem, letter, coord in sites_info:
+        for orbit_id, (elem, letter, coord) in enumerate(sites_info):
             try:
                 if letter not in valid_letters:
                     raise KeyError(f"letter {letter} 不在SG{spacegroup_num}")
@@ -152,6 +244,7 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
                     pos = np.array(op.operate(rep)) % 1.0
                     all_sp.append(elem)
                     all_co.append(pos)
+                    all_orbit_ids.append(orbit_id)
             except Exception as se:
                 n_skip += 1
                 if len(W2S_BAD_LETTERS) < 15:
@@ -160,7 +253,12 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
         
         if all_sp and n_skip <= len(sites_info) // 2:
             s = Structure(lattice, all_sp, all_co)
-            s.merge_sites(tol=0.01, mode='delete')
+            if len(s) != expected_atoms:
+                _w2s_log('atom_count_mismatch')
+                return None
+            if _validated(s, all_orbit_ids, record_overlap=True) is None:
+                _w2s_log('overlap_before_scaling')
+                return None
             #ok = True
             #if len(s) > 1:
             #    dm = s.distance_matrix.copy()
@@ -185,75 +283,15 @@ def wyckoff_to_structure(spacegroup_num, site_elements, site_letters,
                         s.scale_lattice(new_vol)
                 except Exception:
                     pass  # 密度计算失败不影响主流程
+                s = _validated(s, all_orbit_ids, record_overlap=True)
+                if s is None:
+                    _w2s_log('overlap_after_scaling')
+                    return None
                 _w2s_log('尝试1_ops投影手动')
                 return s
     except Exception as e:
-        _w2s_log('尝试1_ops投影手动', e)
+        _w2s_log('lattice_build_error', e)
+        return None
 
-    # pyxtal
-    from pyxtal.lattice import Lattice as PyxtalLattice
-    ltype = getattr(g, 'lattice_type', 'triclinic')
-
-    element_sites = {}
-    for elem, letter, coord in sites_info:
-        if elem not in element_sites:
-            element_sites[elem] = []
-        try:
-            mult = g[letter].multiplicity
-        except Exception:
-            mult = 1
-        element_sites[elem].append((f"{mult}{letter}", coord, mult))
-
-    species = list(element_sites.keys())
-    numIons = [sum(m for _, _, m in element_sites[e]) for e in species]
-    sites_coords = [[{lab: crd} for lab, crd, _ in element_sites[e]] for e in species]
-
-    latt = None
-    for try_ltype in [ltype, 'triclinic']:
-        try:
-            latt = PyxtalLattice.from_para(a, b, c, alpha, beta, gamma, ltype=try_ltype)
-            break
-        except Exception:
-            latt = None
-    if latt is None:
-        try:
-            latt = PyxtalLattice.from_para(8.0, 8.0, 8.0, 90, 90, 90, ltype='cubic')
-        except Exception:
-            latt = None
-
-    # 尝试2：pyxtal build
-    if latt is not None:
-        try:
-            crystal = pyxtal()
-            crystal.build(g, species, numIons, lattice=latt, sites=sites_coords)
-            result = _unwrap_pymatgen(crystal.to_pymatgen())
-            if result is not None:
-                _w2s_log('尝试2_pyxtal_build')
-                return result
-        except Exception:
-            pass
-
-    # 尝试3：from_random + 预测晶格
-    if latt is not None:
-        try:
-            crystal = pyxtal()
-            crystal.from_random(3, spacegroup_num, species, numIons, lattice=latt)
-            result = _unwrap_pymatgen(crystal.to_pymatgen())
-            if result is not None:
-                _w2s_log('尝试3_random+晶格')
-                return result
-        except Exception:
-            pass
-
-    # 尝试4：全随机
-    try:
-        crystal = pyxtal()
-        crystal.from_random(3, spacegroup_num, species, numIons)
-        result = _unwrap_pymatgen(crystal.to_pymatgen())
-        _w2s_log('尝试4_全随机')
-        return result
-    except Exception:
-        pass
-
-    _w2s_log('None')
+    _w2s_log('site_projection_failure')
     return None

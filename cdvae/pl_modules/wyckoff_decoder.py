@@ -1,6 +1,49 @@
+import math
 import numpy as _np
 
-def _fix_lattice(lp, n_atoms=1):
+def _project_lattice_by_spg(lattice_pred, spg_nums):
+    rows = []
+    for i in range(lattice_pred.shape[0]):
+        row = lattice_pred[i]
+        one = row.new_tensor(1.0)
+        spg = int(spg_nums[i].item())
+        if 3 <= spg <= 15:
+            row = torch.stack([row[0], row[1], row[2], one, row[4], one])
+        elif 16 <= spg <= 74:
+            row = torch.stack([row[0], row[1], row[2], one, one, one])
+        elif 75 <= spg <= 142:
+            ab = row[0:2].mean()
+            row = torch.stack([ab, ab, row[2], one, one, one])
+        elif 143 <= spg <= 194:
+            ab = row[0:2].mean()
+            row = torch.stack([ab, ab, row[2], one, one, row.new_tensor(4.0 / 3.0)])
+        elif 195 <= spg <= 230:
+            abc = row[0:3].mean()
+            row = torch.stack([abc, abc, abc, one, one, one])
+        rows.append(row)
+    return torch.stack(rows, dim=0)
+
+
+def _wyckoff_metadata(spg_num, num_letters, device):
+    valid = torch.zeros(num_letters, dtype=torch.bool, device=device)
+    multiplicities = torch.zeros(num_letters, dtype=torch.long, device=device)
+    fixed = torch.zeros(num_letters, dtype=torch.bool, device=device)
+    try:
+        from pyxtal.symmetry import Group
+        from cdvae.pl_data.wyckoff_utils import WYCKOFF_LETTERS
+        for wp in Group(int(spg_num)).Wyckoff_positions:
+            if wp.letter in WYCKOFF_LETTERS[:num_letters]:
+                idx = WYCKOFF_LETTERS.index(wp.letter)
+                valid[idx] = True
+                multiplicities[idx] = int(wp.multiplicity)
+                fixed[idx] = int(wp.get_dof()) == 0
+    except Exception:
+        valid[:] = True
+        multiplicities[:] = 1
+    return valid, multiplicities, fixed
+
+
+def _fix_lattice(lp, n_atoms=1, spg_num=None):
     """晶格参数后处理：
     - 长度：根据原子数动态设定下限，防止晶胞过小导致密度过高
     - 角度：收紧到 [45, 135] 覆盖常见晶系
@@ -29,102 +72,28 @@ def _fix_lattice(lp, n_atoms=1):
     else:
         angles = _np.array([90.0, 90.0, 90.0])
 
+    if spg_num is not None:
+        spg_num = int(spg_num)
+        if 3 <= spg_num <= 15:
+            angles[[0, 2]] = 90.0
+        elif 16 <= spg_num <= 74:
+            angles[:] = 90.0
+        elif 75 <= spg_num <= 142:
+            lengths[0:2] = lengths[0:2].mean()
+            angles[:] = 90.0
+        elif 143 <= spg_num <= 194:
+            lengths[0:2] = lengths[0:2].mean()
+            angles[:] = [90.0, 90.0, 120.0]
+        elif 195 <= spg_num <= 230:
+            lengths[:] = lengths.mean()
+            angles[:] = 90.0
+
     return _np.concatenate([lengths, angles])
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# ============================================================
-# 电荷中性修正（方法1 · 注入点B）：组分确定后用 SMACT 判据检查，
-# 不通过则贪心把某个位点换成模型次高概率元素重判。
-# 与最终 smact_filter 用同一个 smact_validity，保证判据完全一致。
-# ============================================================
-def _smact_ok(elements, letters, spg_num):
-    """用 SMACT 判断 (元素 × 多重度) 组成的化学式是否电荷/氧化态合法。"""
-    try:
-        from smact.screening import smact_validity
-        from pymatgen.core import Composition
-        from pyxtal.symmetry import Group as _Group
-        # 每个位点按其 Wyckoff 多重度计数
-        try:
-            g = _Group(int(spg_num))
-            valid = {wp.letter for wp in g.Wyckoff_positions}
-            counts = {}
-            for el, lt in zip(elements, letters):
-                m = g[lt].multiplicity if lt in valid else 1
-                counts[el] = counts.get(el, 0) + m
-        except Exception:
-            counts = {}
-            for el in elements:
-                counts[el] = counts.get(el, 0) + 1
-        if not counts:
-            return False
-        comp = Composition(counts)
-        return bool(smact_validity(comp, use_pauling_test=True, include_alloys=True))
-    except Exception:
-        # SMACT 不可用或异常时不阻断生成，视为通过（回退到旧行为）
-        return True
-
-
-def _charge_correct(elements, letters, spg_num, elem_rank_z, topk=5):
-    """
-    电荷修正（方向A·严格版）：只在模型每个位点预测的 top-k 元素里换，
-    先尝试改单个位点，不行再尝试改两个位点的组合，直到 SMACT 通过。
-    - 候选严格来自 elem_rank_z（模型 top-k），不引入模型没预测的元素。
-    - letters/多重度不变，只改元素身份；比例不变，靠换价态匹配的元素凑中性。
-    - 都不行则返回原样，交给下游 SMACT 过滤。
-    """
-    if _smact_ok(elements, letters, spg_num):
-        return elements
-
-    from pymatgen.core import Element as _PmgElement
-    base = list(elements)
-    n = len(base)
-
-    def z2sym(z):
-        try:
-            return _PmgElement.from_Z(int(z)).symbol
-        except Exception:
-            return None
-
-    # 每个位点的候选符号列表（top-k，去掉无法解析的）
-    cand = []
-    for s in range(n):
-        ranks = elem_rank_z[s] if s < len(elem_rank_z) else []
-        syms = []
-        for z in ranks[:topk]:
-            sym = z2sym(z)
-            if sym and sym not in syms:
-                syms.append(sym)
-        cand.append(syms if syms else [base[s]])
-
-    # ---- 深度1：改单个位点 ----
-    for s in range(n):
-        for sym in cand[s]:
-            if sym == base[s]:
-                continue
-            trial = list(base)
-            trial[s] = sym
-            if _smact_ok(trial, letters, spg_num):
-                return trial
-
-    # ---- 深度2：改两个位点 ----
-    for s1 in range(n):
-        for s2 in range(s1 + 1, n):
-            for sym1 in cand[s1]:
-                for sym2 in cand[s2]:
-                    trial = list(base)
-                    trial[s1] = sym1
-                    trial[s2] = sym2
-                    if trial == base:
-                        continue
-                    if _smact_ok(trial, letters, spg_num):
-                        return trial
-
-    # 都不行，返回原样
-    return base
 
 
 class WyckoffDecoder(nn.Module):
@@ -139,15 +108,24 @@ class WyckoffDecoder(nn.Module):
         latent_dim: int = 256,
         hidden_dim: int = 256,
         max_sites: int = 12,        # 每个晶体最多预测的Wyckoff位点数
+        max_atoms: int = 20,
         num_spg: int = 230,
         num_wyckoff_letters: int = 27,
         num_elements: int = 100,
+        num_stability_classes: int = 4,
+        site_prior_logvar_min: float = -10.0,
+        site_prior_logvar_max: float = 2.0,
     ):
         super().__init__()
         self.max_sites = max_sites
+        self.max_atoms = max_atoms
         self.num_spg = num_spg
         self.num_letters = num_wyckoff_letters
         self.num_elements = num_elements
+        self.num_stability_classes = num_stability_classes
+        self.stability_null_class = num_stability_classes
+        self.site_prior_logvar_min = site_prior_logvar_min
+        self.site_prior_logvar_max = site_prior_logvar_max
         
         # 特征
         self.fc_shared = nn.Sequential(
@@ -227,6 +205,14 @@ class WyckoffDecoder(nn.Module):
         # cross-attention：decoder site特征attend到per-site latent z
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_norm = nn.LayerNorm(hidden_dim)
+        self.site_self_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
+        self.site_self_attn_norm = nn.LayerNorm(hidden_dim)
+        self.site_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.site_ffn_norm = nn.LayerNorm(hidden_dim)
 
         # site_z_projector 从全局z派生per-site z
         self.site_z_projector = nn.Sequential(
@@ -236,6 +222,16 @@ class WyckoffDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
         )
+        self.site_prior = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.site_prior_log_var = nn.Linear(hidden_dim, hidden_dim)
+        nn.init.zeros_(self.site_prior_log_var.weight)
+        nn.init.constant_(self.site_prior_log_var.bias, math.log(0.2 ** 2))
 
         # ── CFG 元素条件（阶段1）：结构级 multi-hot(100) → hidden_dim ──
         # 训练时注入"该结构含哪些元素"，生成时注入"想要哪些元素(如硫族)"。
@@ -248,30 +244,195 @@ class WyckoffDecoder(nn.Module):
         )
         self.null_elem_cond = nn.Parameter(torch.zeros(hidden_dim))
 
+        # Ehull 条件：0..num_stability_classes-1 为真实类别，最后一类为 null。
+        # 条件同时进入 global heads、site heads 和 conditional site prior。
+        self.stability_emb = nn.Embedding(
+            num_stability_classes + 1, hidden_dim
+        )
+        self.stability_cond_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.site_prior_stability_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
 
-    def forward(self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None, per_site_z=None, enc_padding_mask=None, elem_cond=None, cfg_drop=None):
+
+    def _stability_features(self, z, stability_cond=None, cfg_drop=None):
+        """Return a (B, hidden_dim) stability feature, including null CFG rows."""
+        B = z.shape[0]
+        device = z.device
+        if stability_cond is None:
+            stability_ids = torch.full(
+                (B,), self.stability_null_class,
+                dtype=torch.long, device=device,
+            )
+        else:
+            stability_ids = torch.as_tensor(
+                stability_cond, dtype=torch.long, device=device
+            ).view(-1)
+            if stability_ids.numel() == 1 and B > 1:
+                stability_ids = stability_ids.expand(B)
+            if stability_ids.numel() != B:
+                raise ValueError(
+                    f'stability_cond has {stability_ids.numel()} rows; expected {B}.'
+                )
+            if ((stability_ids < 0) |
+                    (stability_ids >= self.num_stability_classes)).any():
+                raise ValueError(
+                    'stability_cond must be in '
+                    f'[0, {self.num_stability_classes - 1}].'
+                )
+            if cfg_drop is not None:
+                drop = torch.as_tensor(
+                    cfg_drop, dtype=torch.bool, device=device
+                ).view(-1)
+                if drop.numel() != B:
+                    raise ValueError(f'cfg_drop has {drop.numel()} rows; expected {B}.')
+                null_ids = torch.full_like(
+                    stability_ids, self.stability_null_class
+                )
+                stability_ids = torch.where(drop, null_ids, stability_ids)
+        return self.stability_cond_proj(self.stability_emb(stability_ids))
+
+    def site_prior_stats(self, z, stability_cond=None, cfg_drop=None):
+        B = z.shape[0]
+        z_proj = self.site_z_projector(z)                           # (B, hidden_dim)
+        stability_feat = self._stability_features(
+            z, stability_cond=stability_cond, cfg_drop=cfg_drop
+        )
+        z_proj = z_proj + self.site_prior_stability_proj(stability_feat)
+        z_proj = z_proj.unsqueeze(1).expand(B, self.max_sites, -1)  # (B, max_sites, D)
+        pos = self.site_pos_emb.weight.unsqueeze(0).expand(B, -1, -1)
+        prior_mu = self.site_prior(torch.cat([z_proj, pos], dim=-1))
+        prior_log_var = self.site_prior_log_var(prior_mu)
+        prior_log_var = torch.nan_to_num(
+            prior_log_var,
+            nan=self.site_prior_logvar_min,
+            posinf=self.site_prior_logvar_max,
+            neginf=self.site_prior_logvar_min,
+        ).clamp(self.site_prior_logvar_min, self.site_prior_logvar_max)
+        return prior_mu, prior_log_var
+
+    def sample_site_prior(self, z, stability_cond=None, cfg_drop=None, eps=None):
+        prior_mu, prior_log_var = self.site_prior_stats(
+            z, stability_cond=stability_cond, cfg_drop=cfg_drop
+        )
+        if eps is None:
+            eps = torch.randn_like(prior_mu)
+        per_site_z = prior_mu + eps * torch.exp(0.5 * prior_log_var)
+        return per_site_z, prior_mu, prior_log_var
+
+    def build_site_z(self, z, stability_cond=None):
+        prior_mu, _ = self.site_prior_stats(
+            z, stability_cond=stability_cond
+        )
+        return prior_mu
+
+    def global_predictions(
+        self, z, lattice_spg=None, stability_cond=None, cfg_drop=None
+    ):
+        h_global = self.fc_shared(z)  # (B, D)
+        h_global = h_global + self._stability_features(
+            z, stability_cond=stability_cond, cfg_drop=cfg_drop
+        )
+        # 预测空间群
+        spg_logits = self.spg_head(h_global)  # (B, 230)
+        if lattice_spg is None:
+            lattice_spg = spg_logits.argmax(-1) + 1
+        # 预测晶格
+        lattice_pred = _project_lattice_by_spg(self.lattice_head(h_global), lattice_spg)  # (B, 6)
+        # 预测位点数量
+        num_sites_logits = self.num_sites_head(h_global)  # (B, max_sites)
+        return h_global, spg_logits, lattice_pred, num_sites_logits
+
+    def _initial_num_sites(self, spg_nums, num_sites_logits):
+        n_sites = num_sites_logits.argmax(-1) + 1
+        for b in range(n_sites.shape[0]):
+            valid, multiplicities, _ = _wyckoff_metadata(
+                spg_nums[b].item(), self.num_letters, n_sites.device
+            )
+            feasible = multiplicities[valid & (multiplicities > 0) & (multiplicities <= self.max_atoms)]
+            if feasible.numel() > 0:
+                n_sites[b] = min(int(n_sites[b].item()), self.max_atoms // int(feasible.min().item()))
+        return n_sites.clamp(min=1, max=self.max_sites)
+
+    def _constrain_final_letters(self, letter_logits, letter_ids, spg_nums, n_sites):
+        constrained = letter_ids.clone()
+        constrained_n_sites = n_sites.clone()
+        for b in range(letter_logits.shape[0]):
+            valid, multiplicities, fixed = _wyckoff_metadata(
+                spg_nums[b].item(), self.num_letters, letter_logits.device
+            )
+            valid_indices = torch.where(valid & (multiplicities > 0) & (multiplicities <= self.max_atoms))[0]
+            if valid_indices.numel() == 0:
+                continue
+            min_mult = int(multiplicities[valid_indices].min().item())
+            used_fixed = set()
+            atom_count = 0
+            kept = 0
+            for s in range(int(n_sites[b].item())):
+                current = int(letter_ids[b, s].item()) - 1
+                order = torch.argsort(letter_logits[b, s], descending=True).tolist()
+                candidates = ([current] if current >= 0 else []) + [idx for idx in order if idx != current]
+                remaining_sites = int(n_sites[b].item()) - s - 1
+                chosen = None
+                for idx in candidates:
+                    if idx < 0 or idx >= self.num_letters or not bool(valid[idx]):
+                        continue
+                    if bool(fixed[idx]) and idx in used_fixed:
+                        continue
+                    mult = int(multiplicities[idx].item())
+                    if atom_count + mult + remaining_sites * min_mult > self.max_atoms:
+                        continue
+                    chosen = idx
+                    break
+                if chosen is None:
+                    constrained_n_sites[b] = kept
+                    break
+                constrained[b, s] = chosen + 1
+                atom_count += int(multiplicities[chosen].item())
+                if bool(fixed[chosen]):
+                    used_fixed.add(chosen)
+                kept += 1
+            if kept == 0:
+                chosen = int(valid_indices[torch.argmin(multiplicities[valid_indices])].item())
+                constrained[b, 0] = chosen + 1
+                constrained_n_sites[b] = 1
+        return constrained, constrained_n_sites
+
+    def forward(
+        self, z, t=None, noisy_elem_ids=None, noisy_letter_ids=None,
+        per_site_z=None, enc_padding_mask=None, site_padding_mask=None,
+        elem_cond=None, stability_cond=None, cfg_drop=None,
+        lattice_spg=None, global_state=None,
+    ):
         """
         z: (B, latent_dim)
         Returns dict of predictions (logits)
         """
         B = z.shape[0]
-        h = self.fc_shared(z)  # (B, D)
+        if global_state is None:
+            h_global, spg_logits, lattice_pred, num_sites_logits = self.global_predictions(
+                z,
+                lattice_spg=lattice_spg,
+                stability_cond=stability_cond,
+                cfg_drop=cfg_drop,
+            )
+        else:
+            h_global, spg_logits, lattice_pred, num_sites_logits = global_state
+        lattice_raw = self.lattice_head(h_global)
+        h_site = h_global
 
         # 加入时间步条件
         if t is not None:
-            h = h + self.time_emb(t)
-
-        # 预测空间群
-        spg_logits = self.spg_head(h)  # (B, 230)
-        
-        # 预测晶格
-        lattice_pred = self.lattice_head(h)  # (B, 6)
-        
-        # 预测位点数量
-        num_sites_logits = self.num_sites_head(h)  # (B, max_sites)
+            h_site = h_site + self.time_emb(t)
         
         # 解码位点
-        site_h = self.site_decoder(h)  # (B, D)
+        site_h = self.site_decoder(h_site)  # (B, D)
         
         # 展开为每个位点的预测
         #elem_logits = self.element_head(site_h).view(B, self.max_sites, self.num_elements)
@@ -306,18 +467,30 @@ class WyckoffDecoder(nn.Module):
             cond_feat = null_feat
         site_feats = site_feats + cond_feat.unsqueeze(1)           # 广播到 (B, max_sites, D)
 
+        if site_padding_mask is None:
+            site_padding_mask = enc_padding_mask
+        _site_mask = site_padding_mask.clone() if site_padding_mask is not None else None
+        _all_site_pad = _site_mask.all(dim=1) if _site_mask is not None else None
+        if _all_site_pad is not None and _all_site_pad.any():
+            _site_mask[_all_site_pad, 0] = False
+        sa_out, _ = self.site_self_attn(
+            site_feats, site_feats, site_feats,
+            key_padding_mask=_site_mask
+        )
+        site_feats = self.site_self_attn_norm(site_feats + sa_out)
+        site_feats = self.site_ffn_norm(site_feats + self.site_ffn(site_feats))
+
         # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用）
         if per_site_z is not None:
             # 全padding行会让softmax(全-inf)=NaN：临时放开首位，算完还原
-            _all_pad = enc_padding_mask.all(dim=1) if enc_padding_mask is not None else None
+            _enc_mask = enc_padding_mask.clone() if enc_padding_mask is not None else None
+            _all_pad = _enc_mask.all(dim=1) if _enc_mask is not None else None
             if _all_pad is not None and _all_pad.any():
-                enc_padding_mask[_all_pad, 0] = False
+                _enc_mask[_all_pad, 0] = False
             ca_out, _ = self.cross_attn(
                 site_feats, per_site_z, per_site_z,
-                key_padding_mask=enc_padding_mask
+                key_padding_mask=_enc_mask
             )
-            if _all_pad is not None and _all_pad.any():
-                enc_padding_mask[_all_pad, 0] = True
             site_feats = self.cross_attn_norm(site_feats + ca_out)
 
         elem_logits = self.element_head(site_feats)
@@ -327,6 +500,7 @@ class WyckoffDecoder(nn.Module):
         return {
             'spg_logits': spg_logits,           # (B, 230)
             'lattice_pred': lattice_pred,         # (B, 6)
+            'lattice_raw': lattice_raw,           # (B, 6)
             'num_sites_logits': num_sites_logits, # (B, max_sites)
             'elem_logits': elem_logits,           # (B, max_sites, num_elem)
             'letter_logits': letter_logits,       # (B, max_sites, num_letters)
@@ -334,11 +508,16 @@ class WyckoffDecoder(nn.Module):
         }
 
     @torch.no_grad()
-    def decode_to_wyckoff(self, z, temperature=0.5, elem_cond=None, cfg_w=0.0):
+    def decode_to_wyckoff(
+        self, z, temperature=0.5, elem_cond=None,
+        stability_cond=None, cfg_w=0.0,
+    ):
         """
         elem_cond: (B,100) 或 (100,) multi-hot 目标元素集合(如硫族)；None=无条件
+        stability_cond: (B,) 或标量，0表示最低Ehull类别；None=无条件
         cfg_w:     classifier-free guidance 强度。0=普通条件(或无条件)，
-                   >0 时对 elem_logits 外推：logits_uncond + (1+cfg_w)*(logits_cond-logits_uncond)
+                   >0 时对全部结构输出做联合CFG：
+                   pred_uncond + (1+cfg_w)*(pred_cond-pred_uncond)
         """
         B = z.shape[0]
         device = z.device
@@ -349,18 +528,74 @@ class WyckoffDecoder(nn.Module):
             if elem_cond.size(0) == 1 and B > 1:
                 elem_cond = elem_cond.expand(B, -1)
 
-        def _elem_logits_cfg(preds_c, preds_u):
-            """CFG 外推（只作用于 elem_logits）。"""
-            if preds_u is None or cfg_w <= 0:
-                return preds_c['elem_logits']
-            lc = preds_c['elem_logits']
-            lu = preds_u['elem_logits']
-            return lu + (1.0 + cfg_w) * (lc - lu)
+        if stability_cond is not None:
+            stability_cond = torch.as_tensor(
+                stability_cond, dtype=torch.long, device=device
+            ).view(-1)
+            if stability_cond.numel() == 1 and B > 1:
+                stability_cond = stability_cond.expand(B)
+            if stability_cond.numel() != B:
+                raise ValueError(
+                    f'stability_cond has {stability_cond.numel()} rows; expected {B}.'
+                )
 
-        # 预测SPG
-        h_init = self.fc_shared(z)
-        spg_logits_init = self.spg_head(h_init)
+        use_cfg = (
+            cfg_w > 0 and
+            (elem_cond is not None or stability_cond is not None)
+        )
+
+        def _cfg_value(cond_value, uncond_value):
+            if uncond_value is None or not use_cfg:
+                return cond_value
+            return uncond_value + (1.0 + cfg_w) * (
+                cond_value - uncond_value
+            )
+
+        def _cfg_predictions(preds_c, preds_u):
+            """Joint CFG for global, discrete-site and continuous-site outputs."""
+            if preds_u is None or cfg_w <= 0:
+                return preds_c
+            guided = {
+                key: _cfg_value(value, preds_u.get(key))
+                for key, value in preds_c.items()
+            }
+            # Continuous fractional coordinates must remain inside the unit cell.
+            guided['free_params'] = guided['free_params'].clamp(0.0, 1.0 - 1e-7)
+            return guided
+
+        # 条件/无条件 global branches。稳定性条件在这里直接影响 SPG、lattice、site count。
+        h_cond, spg_cond, _, nsites_cond = self.global_predictions(
+            z, stability_cond=stability_cond
+        )
+        if use_cfg:
+            h_uncond, spg_uncond, _, nsites_uncond = self.global_predictions(
+                z, stability_cond=None
+            )
+        else:
+            h_uncond = spg_uncond = nsites_uncond = None
+
+        spg_logits_init = _cfg_value(spg_cond, spg_uncond)
+        num_sites_logits_init = _cfg_value(nsites_cond, nsites_uncond)
         spg_nums = spg_logits_init.argmax(-1) + 1  # (B,) 1-indexed
+        lattice_cond = _project_lattice_by_spg(
+            self.lattice_head(h_cond), spg_nums
+        )
+        lattice_uncond = None
+        if use_cfg:
+            lattice_uncond = _project_lattice_by_spg(
+                self.lattice_head(h_uncond), spg_nums
+            )
+        lattice_pred_init = _cfg_value(lattice_cond, lattice_uncond)
+        global_state_cond = (
+            h_cond, spg_cond, lattice_cond, nsites_cond
+        )
+        global_state_uncond = None
+        if use_cfg:
+            global_state_uncond = (
+                h_uncond, spg_uncond, lattice_uncond, nsites_uncond
+            )
+        n_sites = self._initial_num_sites(spg_nums, num_sites_logits_init)
+        site_padding_mask = torch.arange(self.max_sites, device=device).unsqueeze(0) >= n_sites.unsqueeze(1)
 
         # 构建SPG-letter合法性mask（预缓存所有晶体）
         def build_spg_letter_mask(spg_num, num_letters, device):
@@ -387,22 +622,61 @@ class WyckoffDecoder(nn.Module):
         ])  # (B, num_letters)
 
         
-        # site_z_projector(z)，携带全局晶体化学信息
-        z_proj = self.site_z_projector(z)                           # (B, hidden_dim)
-        z_proj = z_proj.unsqueeze(1).expand(B, self.max_sites, -1)  # (B, max_sites, D)
-        per_site_z = z_proj + torch.randn_like(z_proj) * 0.2       # 小噪声保持多样性
+        # 条件 site prior；CFG 两个分支共用同一 eps，差异只来自条件。
+        prior_mu_cond, prior_log_var_cond = self.site_prior_stats(
+            z, stability_cond=stability_cond
+        )
+        site_eps = torch.randn_like(prior_mu_cond)
+        per_site_z_cond = prior_mu_cond + site_eps * torch.exp(
+            0.5 * prior_log_var_cond
+        )
+        per_site_z_uncond = None
+        if use_cfg:
+            prior_mu_uncond, prior_log_var_uncond = self.site_prior_stats(
+                z, stability_cond=None
+            )
+            per_site_z_uncond = prior_mu_uncond + site_eps * torch.exp(
+                0.5 * prior_log_var_uncond
+            )
 
         noisy_elem_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
         noisy_letter_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
 
+        def _predict_step(t_value, padding_mask):
+            preds_cond = self.forward(
+                z,
+                t=t_value,
+                noisy_elem_ids=noisy_elem_ids,
+                noisy_letter_ids=noisy_letter_ids,
+                per_site_z=per_site_z_cond,
+                enc_padding_mask=padding_mask,
+                site_padding_mask=padding_mask,
+                elem_cond=elem_cond,
+                stability_cond=stability_cond,
+                lattice_spg=spg_nums,
+                global_state=global_state_cond,
+            )
+            if not use_cfg:
+                return preds_cond
+            preds_uncond = self.forward(
+                z,
+                t=t_value,
+                noisy_elem_ids=noisy_elem_ids,
+                noisy_letter_ids=noisy_letter_ids,
+                per_site_z=per_site_z_uncond,
+                enc_padding_mask=padding_mask,
+                site_padding_mask=padding_mask,
+                elem_cond=None,
+                stability_cond=None,
+                lattice_spg=spg_nums,
+                global_state=global_state_uncond,
+            )
+            return _cfg_predictions(preds_cond, preds_uncond)
+
         # 去噪：从T到1
         for step in range(self.T, 0, -1):
             t = torch.full((B,), step, dtype=torch.long, device=device)
-            preds = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=elem_cond)
-            # CFG：额外跑一次无条件分支并外推 elem_logits
-            if elem_cond is not None and cfg_w > 0:
-                preds_u = self.forward(z, t=t, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=None)
-                preds['elem_logits'] = _elem_logits_cfg(preds, preds_u)
+            preds = _predict_step(t, site_padding_mask)
 
             # 对所有位点采样elem
             elem_probs = torch.softmax(preds['elem_logits'] / temperature, dim=-1)  # (B, S, 100)
@@ -425,27 +699,29 @@ class WyckoffDecoder(nn.Module):
 
     
             still_masked = (noisy_elem_ids == 0)
-            update = still_masked & should_unmask
+            update = still_masked & should_unmask & ~site_padding_mask
             noisy_elem_ids = torch.where(update, sampled_elems, noisy_elem_ids)
             noisy_letter_ids = torch.where(update, sampled_letters, noisy_letter_ids)
 
-    
+        
         t_final = torch.ones(B, dtype=torch.long, device=device)
-        preds = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=elem_cond)
-        if elem_cond is not None and cfg_w > 0:
-            preds_u = self.forward(z, t=t_final, noisy_elem_ids=noisy_elem_ids, noisy_letter_ids=noisy_letter_ids, per_site_z=per_site_z, elem_cond=None)
-            preds['elem_logits'] = _elem_logits_cfg(preds, preds_u)
+        preds = _predict_step(t_final, site_padding_mask)
+        noisy_letter_ids, n_sites = self._constrain_final_letters(
+            preds['letter_logits'], noisy_letter_ids, spg_nums, n_sites
+        )
+        site_padding_mask = torch.arange(self.max_sites, device=device).unsqueeze(0) >= n_sites.unsqueeze(1)
+        preds = _predict_step(t_final, site_padding_mask)
 
         results = []
         for i in range(B):
             # 用与 letter mask 一致的 spg（spg_nums，初始预测, 避免 t=1 重新argmax得到不同spg，导致letter与空间群不匹配
             spg_num = int(spg_nums[i].item())
-            n_sites = preds['num_sites_logits'][i].argmax().item() + 1
+            n_sites_i = int(n_sites[i].item())
 
             elements = []
             letters = []
             free_params = []
-            for s in range(n_sites):
+            for s in range(n_sites_i):
         
                 elem_z = noisy_elem_ids[i, s].item()
                 if elem_z == 0:
@@ -469,14 +745,6 @@ class WyckoffDecoder(nn.Module):
                 letters.append(letter)
                 free_params.append(fp)
 
-            # --- 电荷中性修正（方法1·注入点B）---
-            # 用最终一次 forward 的 elem_logits 拿到每个位点的元素概率排序（Z从高到低）
-            _elem_rank_z = []
-            for s in range(n_sites):
-                order = torch.argsort(preds['elem_logits'][i, s], descending=True)
-                _elem_rank_z.append([(int(k) + 1) for k in order[:5].tolist()])  # top5, +1转Z
-            elements = _charge_correct(elements, letters, spg_num, _elem_rank_z)
-
             # 计算展开后的总原子数，用于 _fix_lattice 的动态长度下限
             try:
                 from pyxtal.symmetry import Group as _Group
@@ -487,14 +755,14 @@ class WyckoffDecoder(nn.Module):
                     for lt in letters
                 )
             except Exception:
-                _n_atoms = n_sites * 2
+                _n_atoms = n_sites_i * 2
 
             results.append({
                 'spacegroup_num': spg_num,
                 'site_elements': elements,
                 'site_letters': letters,
                 'site_free_params': free_params,
-                'lattice_params': _fix_lattice(preds['lattice_pred'][i].cpu().numpy() * _np.array([10., 10., 10., 90., 90., 90.]), n_atoms=_n_atoms),  # ×lat_scale 还原归一化（训练时 target/lat_scale，生成必须乘回）
-                'num_sites': n_sites,
+                'lattice_params': _fix_lattice(lattice_pred_init[i].cpu().numpy() * _np.array([10., 10., 10., 90., 90., 90.]), n_atoms=_n_atoms, spg_num=spg_num),  # ×lat_scale 还原归一化（训练时 target/lat_scale，生成必须乘回）
+                'num_sites': n_sites_i,
             })
         return results

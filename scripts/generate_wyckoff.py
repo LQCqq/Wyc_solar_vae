@@ -14,20 +14,26 @@ for pyc in pathlib.Path('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA
 os.chdir('/srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae')
 
 from cdvae.pl_modules.model import WyckoffCDVAE
+from cdvae.pl_data.wyckoff_utils import w2s_report
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', type=str,
-                   default='/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-08-09/test_wyckoff/epoch=102-step=10918.ckpt')
+                   default='/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-09-07/wyckoff_new/epoch=178-step=18974.ckpt')
     p.add_argument('--out_dir', type=str,
                    default='/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures/charge_refactor_structure')
     p.add_argument('--num_samples', type=int, default=3500)
     p.add_argument('--target_elements', type=str, default=None,
                    help='目标元素,逗号分隔,如 "S,Se,Te"。不传=无条件生成')
     p.add_argument('--cfg_w', type=float, default=0.0,
-                   help='CFG引导强度,0=无引导,越大越偏向目标元素(牺牲多样性)')
-    p.add_argument('--must_contain', type=str, default='any',
+                   help='联合CFG强度：0=普通条件生成，>0增强元素/Ehull条件')
+    p.add_argument('--stability_class', type=int, default=None,
+                   choices=[0, 1, 2, 3],
+                   help=('Ehull条件类别；不传=unconditional。默认分箱：'
+                         '0:Ehull<=0, 1:(0,0.01], '
+                         '2:(0.01,0.03], 3:>0.03 eV/atom'))
+    p.add_argument('--must_contain', type=str, default='off',
                    choices=['off', 'any', 'all'],
                    help='硬过滤: off=不过滤; any=含目标元素至少一个; all=全含')
     return p.parse_args()
@@ -61,19 +67,31 @@ def main():
     model.eval()
 
     elem_cond, target_zs = build_elem_cond(args.target_elements)
+    stability_cond = None
+    if args.stability_class is not None:
+        stability_cond = torch.tensor(
+            [args.stability_class], dtype=torch.long
+        )
     if elem_cond is not None:
         print(f'目标元素: {args.target_elements} (Z={sorted(target_zs)})  '
               f'cfg_w={args.cfg_w}  must_contain={args.must_contain}')
     else:
         print('无条件生成（未指定 target_elements）')
+    if stability_cond is None:
+        print('Ehull条件: unconditional')
+    else:
+        print(f'Ehull条件类别: {args.stability_class}  cfg_w={args.cfg_w}')
 
     print(f'生成 {args.num_samples} 个结构...')
     with torch.no_grad():
         structures = model.generate(
             num_samples=args.num_samples,
             elem_cond=elem_cond,
+            stability_cond=stability_cond,
             cfg_w=args.cfg_w,
         )
+
+    w2s_report()
 
     def keep(struct):
         if struct is None:

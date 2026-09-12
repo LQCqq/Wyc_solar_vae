@@ -23,9 +23,9 @@ cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/cdvae
 source /srv/scratch/z5561341/miniconda3/bin/activate
 conda activate cdvae2
 python /srv/scratch/ml4matdis/Quanli_Project/z5561341/projectA/cdvae/scripts/generate_wyckoff.py \
-   --out_dir $OUTPUT_test \
-   --num_samples 1000 \
-   --target_elements "O" \
-   --cfg_w 2 \
-   --must_contain all
+   --out_dir $OUTPUT \
+   --num_samples 2500
+#   --target_elements "Ba,Ti,O" \
+#   --cfg_w 2 \
+#   --must_contain all
 

@@ -71,13 +71,13 @@ class WyckoffEmbedding(nn.Module):
     def forward(self, data, elem_mask=None):
         # Embedding 越界检测：CUDA 上越界会污染整个 context，后续算子抛出无关错误
         for _t, _n, _nm in [(data.wyk_letters,    self.letter_emb.num_embeddings,  'wyk_letters'),
-                            (data.wyk_atom_types, self.element_emb.num_embeddings, 'wyk_atom_types'),
+                            (data.wyk_atom_types - 1, self.element_emb.num_embeddings, 'wyk_atom_types'),
                             (data.spg_idx,        self.spg_emb.num_embeddings,     'spg_idx')]:
             _tc = _t.detach().cpu()
             if int(_tc.min()) < 0 or int(_tc.max()) >= _n:
                 raise RuntimeError(f"[越界] {_nm}: 范围[{int(_tc.min())},{int(_tc.max())}] 容量 {_n}")
         letter_feat = self.letter_emb(data.wyk_letters)
-        elem_feat = self.element_emb(data.wyk_atom_types)
+        elem_feat = self.element_emb(data.wyk_atom_types - 1)
         if elem_mask is not None:
             mask_token = self.elem_mask_token.unsqueeze(0).expand_as(elem_feat)
             elem_feat = torch.where(
