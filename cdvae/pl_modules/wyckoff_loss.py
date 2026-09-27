@@ -3,9 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+try:
+    from scipy.optimize import linear_sum_assignment as _scipy_assignment
+except Exception:
+    _scipy_assignment = None
+
 
 import json as _json
 from pathlib import Path as _Path
+
+# Runtime/interface marker used to verify that model.py loaded the independent
+# Element/Letter mask implementation rather than an older same-named file.
+WYCKOFF_LOSS_INTERFACE_VERSION = "independent_element_letter_masks_v1"
 
 _TABLE_DIR = _Path(__file__).parent.parent / "pl_data"   
 _RADII_TENSOR = None
@@ -40,6 +49,7 @@ def _get_oxi_tensor(device):
 
 # Overlap Penalty 对称缓存
 _OVERLAP_OPS_CACHE = {}
+_METRIC_MULTIPLICITY_CACHE = {}
 
 # Wyckoff letter 表获取
 _WYCKOFF_LETTERS = list(
@@ -85,6 +95,226 @@ def _get_ops_cpu(spg_num, letter_idx):
         t0   = torch.zeros(3)
     result = (R, t, R0, t0)
     _OVERLAP_OPS_CACHE[key] = result
+    return result
+
+
+def _solve_linear_assignment(cost_matrix):
+    """Return an exact one-to-one minimum-cost assignment.
+
+    SciPy uses the Hungarian/Jonker-Volgenant solver when available. The small
+    dynamic-programming fallback is exact and practical because max_sites=12.
+    """
+    cost = np.nan_to_num(
+        np.asarray(cost_matrix, dtype=np.float64),
+        nan=1e6, posinf=1e6, neginf=-1e6,
+    )
+    n_rows, n_cols = cost.shape
+    if n_rows != n_cols:
+        raise ValueError(f'Expected a square cost matrix, got {cost.shape}.')
+    if n_rows == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    if _scipy_assignment is not None:
+        return _scipy_assignment(cost)
+
+    # Exact fallback: row-by-row subset dynamic programming, O(n^2 2^n).
+    states = {0: (0.0, ())}
+    for row in range(n_rows):
+        next_states = {}
+        for used_mask, (running_cost, path) in states.items():
+            for col in range(n_cols):
+                bit = 1 << col
+                if used_mask & bit:
+                    continue
+                new_mask = used_mask | bit
+                new_cost = running_cost + float(cost[row, col])
+                old = next_states.get(new_mask)
+                if old is None or new_cost < old[0]:
+                    next_states[new_mask] = (new_cost, path + (col,))
+        states = next_states
+    full_mask = (1 << n_cols) - 1
+    cols = np.asarray(states[full_mask][1], dtype=np.int64)
+    return np.arange(n_rows, dtype=np.int64), cols
+
+
+def _metric_multiplicity_table(spg_num, num_letters, max_atoms):
+    key = (int(spg_num), int(num_letters), int(max_atoms))
+    cached = _METRIC_MULTIPLICITY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    invalid_multiplicity = int(max_atoms) + 1
+    values = [invalid_multiplicity] * int(num_letters)
+    try:
+        from pyxtal.symmetry import Group
+        group = Group(int(spg_num))
+        letter_to_multiplicity = {
+            position.letter: len(position.ops)
+            for position in group.Wyckoff_positions
+        }
+        for letter_idx in range(num_letters):
+            if letter_idx >= len(_WYCKOFF_LETTERS):
+                break
+            multiplicity = int(
+                letter_to_multiplicity.get(
+                    _WYCKOFF_LETTERS[letter_idx], invalid_multiplicity
+                )
+            )
+            values[letter_idx] = (
+                multiplicity if multiplicity > 0 else invalid_multiplicity
+            )
+    except Exception:
+        pass
+    result = torch.tensor(values, dtype=torch.float32)
+    _METRIC_MULTIPLICITY_CACHE[key] = result
+    return result
+
+
+def _masked_set_diagnostics(
+    preds,
+    targets,
+    site_mask,
+    masked_sites,
+    max_atoms=20,
+):
+    """Permutation-aware diagnostics for masked sites; never used as a loss."""
+    metric_names = (
+        'acc_elem_masked_hungarian',
+        'acc_letter_masked_hungarian',
+        'dist_free_masked_hungarian',
+        'elem_multiset_precision_masked',
+        'elem_multiset_recall_masked',
+        'hungarian_cost_masked',
+        'n_elem_hungarian_masked',
+        'n_structures_hungarian_masked',
+    )
+    result = {name: 0.0 for name in metric_names}
+    if masked_sites is None:
+        return result
+
+    with torch.no_grad():
+        masked_valid = site_mask.bool() & masked_sites.bool()
+        elem_nll = -F.log_softmax(preds['elem_logits'], dim=-1).detach().cpu()
+        letter_nll = -F.log_softmax(
+            preds['letter_logits'], dim=-1
+        ).detach().cpu()
+        letter_probs = F.softmax(
+            preds['letter_logits'], dim=-1
+        ).detach().cpu()
+        pred_elem = preds['elem_logits'].argmax(dim=-1).detach().cpu()
+        pred_letter = preds['letter_logits'].argmax(dim=-1).detach().cpu()
+        pred_free = preds['free_params'].detach().cpu().float()
+        target_elem = targets['elem_target'].detach().cpu().long()
+        target_letter = targets['letter_target'].detach().cpu().long()
+        target_free = targets['free_target'].detach().cpu().float()
+        target_multi = targets['multiplicities'].detach().cpu().float()
+        spg_target = targets['spg_target'].detach().cpu().long()
+        masked_valid = masked_valid.detach().cpu()
+
+        elem_correct_total = 0.0
+        letter_correct_total = 0.0
+        free_distance_total = 0.0
+        assignment_cost_total = 0.0
+        multiset_intersection_total = 0.0
+        predicted_count_total = 0.0
+        target_count_total = 0.0
+        matched_site_total = 0.0
+        matched_structure_total = 0.0
+
+        for batch_idx in range(masked_valid.shape[0]):
+            indices = torch.where(masked_valid[batch_idx])[0]
+            n_masked = int(indices.numel())
+            if n_masked == 0:
+                continue
+
+            target_elem_i = target_elem[batch_idx, indices]
+            target_letter_i = target_letter[batch_idx, indices]
+            elem_cost = elem_nll[batch_idx, indices][:, target_elem_i]
+            letter_cost = letter_nll[batch_idx, indices][:, target_letter_i]
+
+            delta = (
+                pred_free[batch_idx, indices][:, None, :]
+                - target_free[batch_idx, indices][None, :, :]
+            )
+            delta = delta - torch.round(delta)
+            coordinate_cost = torch.linalg.vector_norm(delta, dim=-1) / np.sqrt(3.0)
+
+            spg_num = int(spg_target[batch_idx].item()) + 1
+            multiplicity_table = _metric_multiplicity_table(
+                spg_num,
+                preds['letter_logits'].shape[-1],
+                max_atoms,
+            )
+            expected_multi = (
+                letter_probs[batch_idx, indices] * multiplicity_table
+            ).sum(dim=-1)
+            multiplicity_cost = (
+                expected_multi[:, None]
+                - target_multi[batch_idx, indices][None, :]
+            ).abs() / max(float(max_atoms), 1.0)
+
+            # Composite matching avoids defining the assignment from element
+            # labels alone. It remains evaluation-only and is fully detached.
+            cost = (
+                elem_cost
+                + 0.5 * letter_cost
+                + 0.2 * coordinate_cost
+                + 0.2 * multiplicity_cost
+            )
+            row_np, col_np = _solve_linear_assignment(cost.numpy())
+            rows = torch.as_tensor(row_np, dtype=torch.long)
+            cols = torch.as_tensor(col_np, dtype=torch.long)
+            pred_indices = indices[rows]
+            target_indices = indices[cols]
+
+            elem_correct_total += float((
+                pred_elem[batch_idx, pred_indices]
+                == target_elem[batch_idx, target_indices]
+            ).sum().item())
+            letter_correct_total += float((
+                pred_letter[batch_idx, pred_indices]
+                == target_letter[batch_idx, target_indices]
+            ).sum().item())
+            matched_delta = (
+                pred_free[batch_idx, pred_indices]
+                - target_free[batch_idx, target_indices]
+            )
+            matched_delta = matched_delta - torch.round(matched_delta)
+            free_distance_total += float(
+                torch.linalg.vector_norm(matched_delta, dim=-1).sum().item()
+            )
+            assignment_cost_total += float(cost[rows, cols].sum().item())
+
+            pred_counts = torch.bincount(
+                pred_elem[batch_idx, indices],
+                minlength=preds['elem_logits'].shape[-1],
+            )
+            target_counts = torch.bincount(
+                target_elem_i,
+                minlength=preds['elem_logits'].shape[-1],
+            )
+            multiset_intersection_total += float(
+                torch.minimum(pred_counts, target_counts).sum().item()
+            )
+            predicted_count_total += float(pred_counts.sum().item())
+            target_count_total += float(target_counts.sum().item())
+            matched_site_total += float(n_masked)
+            matched_structure_total += 1.0
+
+    site_denom = max(matched_site_total, 1.0)
+    result.update({
+        'acc_elem_masked_hungarian': elem_correct_total / site_denom,
+        'acc_letter_masked_hungarian': letter_correct_total / site_denom,
+        'dist_free_masked_hungarian': free_distance_total / site_denom,
+        'elem_multiset_precision_masked': (
+            multiset_intersection_total / max(predicted_count_total, 1.0)
+        ),
+        'elem_multiset_recall_masked': (
+            multiset_intersection_total / max(target_count_total, 1.0)
+        ),
+        'hungarian_cost_masked': assignment_cost_total / site_denom,
+        'n_elem_hungarian_masked': matched_site_total,
+        'n_structures_hungarian_masked': matched_structure_total,
+    })
     return result
 
 
@@ -400,7 +630,7 @@ def _lattice_matrix_torch(lattice_normalized, atom_count, spg_indices):
 
 
 def _overlap_penalty(preds, max_atoms=20, margin=0.05, tau=1.0, spg_topk=3,
-                     stochastic=False):
+                     stochastic=False, elem_grad_scale=1.0):
     free_params = preds['free_params'].float()
     device = free_params.device
     dtype = free_params.dtype
@@ -453,7 +683,13 @@ def _overlap_penalty(preds, max_atoms=20, margin=0.05, tau=1.0, spg_topk=3,
         preds['elem_logits'].float(), tau, stochastic=stochastic
     )
     radii_table = _get_radii_tensor(device)[1:1 + num_elements].to(dtype)
-    site_radii = torch.einsum('bse,e->bs', elem_st, radii_table)
+    site_radii_soft = torch.einsum('bse,e->bs', elem_st, radii_table)
+    # 前向使用完全相同的预测半径；只缩放 overlap loss 返回 element logits 的梯度。
+    # 1.0 = 当前 joint-overlap 逻辑；0.0 = 诊断性切断；0.2 = 保留 20% 梯度。
+    elem_grad_scale = max(float(elem_grad_scale), 0.0)
+    site_radii = site_radii_soft.detach() + elem_grad_scale * (
+        site_radii_soft - site_radii_soft.detach()
+    )
     atom_radii = site_radii[:, None, :, None].expand(-1, K, -1, max_atoms)
     atom_radii = atom_radii.reshape(B, K, S * max_atoms)
 
@@ -542,7 +778,8 @@ class WyckoffReconLoss(nn.Module):
                  mask_weight=3.0,
                  w_overlap=0.0, overlap_threshold=None,  # threshold 已弃用，保留兼容
                  w_charge=0.0, max_atoms=20, overlap_margin=0.05,
-                 overlap_tau=1.0, overlap_spg_topk=3):
+                 overlap_tau=1.0, overlap_spg_topk=3,
+                 overlap_elem_grad_scale=1.0):
         super().__init__()
         self.w_spg     = w_spg
         self.w_lattice = w_lattice
@@ -557,8 +794,24 @@ class WyckoffReconLoss(nn.Module):
         self.overlap_margin = overlap_margin
         self.overlap_tau = overlap_tau
         self.overlap_spg_topk = overlap_spg_topk
+        self.overlap_elem_grad_scale = overlap_elem_grad_scale
 
-    def forward(self, preds, targets, site_mask, masked_sites=None):
+    def forward(
+        self,
+        preds,
+        targets,
+        site_mask,
+        masked_sites=None,
+        masked_elem_sites=None,
+        masked_letter_sites=None,
+    ):
+
+        # Backward compatibility: older callers supplied one shared mask as the
+        # fourth positional argument. New training supplies independent masks.
+        if masked_elem_sites is None:
+            masked_elem_sites = masked_sites
+        if masked_letter_sites is None:
+            masked_letter_sites = masked_sites
 
         # 重建 loss 
         loss_spg = F.cross_entropy(preds['spg_logits'], targets['spg_target'])
@@ -587,13 +840,72 @@ class WyckoffReconLoss(nn.Module):
             targets['elem_target'].view(-1),
             reduction='none'
         ).view_as(site_mask)
-        if masked_sites is not None:
+        if masked_elem_sites is not None:
             elem_weight = mask.clone()
-            elem_weight[masked_sites & site_mask] = self.mask_weight
+            elem_weight[masked_elem_sites & site_mask] = self.mask_weight
         else:
             elem_weight = mask
         loss_elem = (elem_loss * elem_weight).sum() / elem_weight.sum().clamp(min=1)
         loss_elem = torch.nan_to_num(loss_elem.abs(), nan=0.0)
+
+        # Element 诊断：把 masked / unmasked valid sites 分开统计。
+        # 这些量只用于日志，不参与 total loss。
+        valid_sites = site_mask.bool()
+        if masked_elem_sites is None:
+            masked_valid = torch.zeros_like(valid_sites)
+            unmasked_valid = valid_sites
+        else:
+            masked_valid = valid_sites & masked_elem_sites.bool()
+            unmasked_valid = valid_sites & (~masked_elem_sites.bool())
+
+        elem_pred = preds['elem_logits'].argmax(dim=-1)
+        elem_correct = elem_pred.eq(targets['elem_target']).float()
+
+        def _diagnostic_mean(values, selected):
+            selected_f = selected.float()
+            return (values * selected_f).sum() / selected_f.sum().clamp(min=1.0)
+
+        loss_elem_masked = _diagnostic_mean(elem_loss, masked_valid)
+        loss_elem_unmasked = _diagnostic_mean(elem_loss, unmasked_valid)
+        acc_elem_masked = _diagnostic_mean(elem_correct, masked_valid)
+        acc_elem_unmasked = _diagnostic_mean(elem_correct, unmasked_valid)
+        n_elem_masked = masked_valid.float().sum()
+        n_elem_unmasked = unmasked_valid.float().sum()
+
+        # Validation/test-only set diagnostics. These metrics compare unordered
+        # masked Wyckoff sites with an exact one-to-one assignment and never
+        # participate in the training objective or gradient computation.
+        set_diagnostics = {}
+        if not self.training:
+            # Permutation-aware matching is only unambiguous when both element
+            # and letter were hidden. The ordinary per-head metrics below still
+            # use their full independent masks.
+            if masked_elem_sites is None or masked_letter_sites is None:
+                joint_masked_sites = masked_elem_sites
+            else:
+                joint_masked_sites = (
+                    masked_elem_sites.bool() & masked_letter_sites.bool()
+                )
+            set_diagnostics = _masked_set_diagnostics(
+                preds,
+                targets,
+                site_mask,
+                joint_masked_sites,
+                max_atoms=self.max_atoms,
+            )
+            if joint_masked_sites is None:
+                joint_masked_valid = torch.zeros_like(valid_sites)
+            else:
+                joint_masked_valid = (
+                    valid_sites & joint_masked_sites.bool()
+                )
+            joint_slot_elem_acc = _diagnostic_mean(
+                elem_correct, joint_masked_valid
+            )
+            set_diagnostics['acc_elem_masked_hungarian_gain'] = (
+                set_diagnostics['acc_elem_masked_hungarian']
+                - float(joint_slot_elem_acc.item())
+            )
 
         # letter loss（diffusion 加权）
         letter_loss = F.cross_entropy(
@@ -601,13 +913,36 @@ class WyckoffReconLoss(nn.Module):
             targets['letter_target'].view(-1),
             reduction='none'
         ).view_as(site_mask)
-        if masked_sites is not None:
+        if masked_letter_sites is not None:
             letter_weight = mask.clone()
-            letter_weight[masked_sites & site_mask] = self.mask_weight
+            letter_weight[masked_letter_sites & site_mask] = self.mask_weight
         else:
             letter_weight = mask
         loss_letter = (letter_loss * letter_weight).sum() / letter_weight.sum().clamp(min=1)
         loss_letter = torch.nan_to_num(loss_letter.abs(), nan=0.0)
+
+        if masked_letter_sites is None:
+            letter_masked_valid = torch.zeros_like(valid_sites)
+            letter_unmasked_valid = valid_sites
+        else:
+            letter_masked_valid = valid_sites & masked_letter_sites.bool()
+            letter_unmasked_valid = valid_sites & (~masked_letter_sites.bool())
+        letter_pred = preds['letter_logits'].argmax(dim=-1)
+        letter_correct = letter_pred.eq(targets['letter_target']).float()
+        loss_letter_masked = _diagnostic_mean(
+            letter_loss, letter_masked_valid
+        )
+        loss_letter_unmasked = _diagnostic_mean(
+            letter_loss, letter_unmasked_valid
+        )
+        acc_letter_masked = _diagnostic_mean(
+            letter_correct, letter_masked_valid
+        )
+        acc_letter_unmasked = _diagnostic_mean(
+            letter_correct, letter_unmasked_valid
+        )
+        n_letter_masked = letter_masked_valid.float().sum()
+        n_letter_unmasked = letter_unmasked_valid.float().sum()
 
         # free loss
         free_loss = F.mse_loss(
@@ -626,6 +961,7 @@ class WyckoffReconLoss(nn.Module):
                     tau=self.overlap_tau,
                     spg_topk=self.overlap_spg_topk,
                     stochastic=self.training,
+                    elem_grad_scale=self.overlap_elem_grad_scale,
                 )
             except Exception as e:
                 if not getattr(self, '_overlap_error_printed', False):
@@ -674,7 +1010,7 @@ class WyckoffReconLoss(nn.Module):
             self.w_charge  * loss_charge
         )
 
-        return total, {
+        metrics = {
             'loss_spg':     loss_spg.item(),
             'loss_lattice': loss_lattice.item(),
             'loss_nsites':  loss_nsites.item(),
@@ -683,4 +1019,18 @@ class WyckoffReconLoss(nn.Module):
             'loss_free':    loss_free.item(),
             'loss_overlap': loss_overlap.item(),
             'loss_charge':  loss_charge.item(),
+            'loss_elem_masked':   loss_elem_masked.item(),
+            'loss_elem_unmasked': loss_elem_unmasked.item(),
+            'acc_elem_masked':    acc_elem_masked.item(),
+            'acc_elem_unmasked':  acc_elem_unmasked.item(),
+            'n_elem_masked':      n_elem_masked.item(),
+            'n_elem_unmasked':    n_elem_unmasked.item(),
+            'loss_letter_masked':   loss_letter_masked.item(),
+            'loss_letter_unmasked': loss_letter_unmasked.item(),
+            'acc_letter_masked':    acc_letter_masked.item(),
+            'acc_letter_unmasked':  acc_letter_unmasked.item(),
+            'n_letter_masked':      n_letter_masked.item(),
+            'n_letter_unmasked':    n_letter_unmasked.item(),
         }
+        metrics.update(set_diagnostics)
+        return total, metrics

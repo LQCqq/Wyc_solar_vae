@@ -31,6 +31,20 @@ def build_mlp(in_dim, hidden_dim, fc_num_layers, out_dim):
     return nn.Sequential(*mods)
 
 
+def _linear_ramp(epoch, start_epoch, end_epoch, max_value):
+    """Linearly ramp from zero to ``max_value`` over an epoch interval."""
+    epoch = float(epoch)
+    start_epoch = float(start_epoch)
+    end_epoch = float(end_epoch)
+    max_value = max(float(max_value), 0.0)
+    if epoch <= start_epoch:
+        return 0.0
+    if end_epoch <= start_epoch:
+        return max_value
+    progress = min(max((epoch - start_epoch) / (end_epoch - start_epoch), 0.0), 1.0)
+    return max_value * progress
+
+
 class BaseModule(pl.LightningModule):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
@@ -157,6 +171,24 @@ class WyckoffCDVAE(BaseModule):
             ),
             site_prior_logvar_min=getattr(self.hparams, 'site_prior_logvar_min', -10.0),
             site_prior_logvar_max=getattr(self.hparams, 'site_prior_logvar_max', 2.0),
+            use_joint_site_planner=getattr(
+                self.hparams, 'use_joint_site_planner', True
+            ),
+            site_planner_num_layers=getattr(
+                self.hparams, 'site_planner_num_layers', 2
+            ),
+            site_planner_num_heads=getattr(
+                self.hparams, 'site_planner_num_heads', 4
+            ),
+            site_planner_dropout=getattr(
+                self.hparams, 'site_planner_dropout', 0.1
+            ),
+            iterative_site_refinement=getattr(
+                self.hparams, 'iterative_site_refinement', True
+            ),
+            site_remask_power=getattr(
+                self.hparams, 'site_remask_power', 1.0
+            ),
         )
 
         # loss
@@ -173,6 +205,9 @@ class WyckoffCDVAE(BaseModule):
             overlap_margin=getattr(self.hparams, 'overlap_margin', 0.05),
             overlap_tau=getattr(self.hparams, 'overlap_tau', 1.0),
             overlap_spg_topk=getattr(self.hparams, 'overlap_spg_topk', 3),
+            overlap_elem_grad_scale=getattr(
+                self.hparams, 'overlap_elem_grad_scale', 1.0
+            ),
         )
 
         # diffusion步数
@@ -201,11 +236,19 @@ class WyckoffCDVAE(BaseModule):
         device = batch.wyk_atom_types.device
         N = batch.wyk_atom_types.shape[0]  # 总位点数
 
-        # 多步masked diffusion：采样全局时间步 t ~ Uniform(1, T)
-        t = torch.randint(1, self.T + 1, (1,), device=device)  # 全局单一时间步
+        # 训练：随机 diffusion 时间步；validation/test：固定时间步，便于公平比较。
+        if self.training:
+            t = torch.randint(1, self.T + 1, (1,), device=device)
+        else:
+            eval_t = int(getattr(self.hparams, 'eval_diffusion_t', 50))
+            eval_t = max(1, min(self.T, eval_t))
+            t = torch.tensor([eval_t], device=device, dtype=torch.long)
         t_batch = t.expand(B)  # (B,) 同一个t广播给所有晶体
         mask_prob = t.float() / self.T  # 标量
+        # Element 与 letter 使用独立 Bernoulli mask。两者仍共享同一个 t，
+        # 但某个 site 的 element/letter 是否可见不再被强制绑定。
         elem_mask = torch.rand(N, device=device) < mask_prob  # (N,) flat mask
+        letter_mask = torch.rand(N, device=device) < mask_prob  # (N,) flat mask
 
         # encoder：接收干净完整数据（真正的diffusion：噪声进decoder，不进encoder）
         mu, log_var, per_site_mu, per_site_log_var, enc_padding_mask = self.encoder(batch)
@@ -216,7 +259,8 @@ class WyckoffCDVAE(BaseModule):
 
         # 将flat elem_mask转换为(B, max_sites)格式，用于loss加权和noisy输入
         S = self.decoder.max_sites
-        masked_sites = torch.zeros(B, S, dtype=torch.bool, device=device)
+        masked_elem_sites = torch.zeros(B, S, dtype=torch.bool, device=device)
+        masked_letter_sites = torch.zeros(B, S, dtype=torch.bool, device=device)
     
 
         num_sites_cpu = batch.num_wyk_sites.cpu()
@@ -225,7 +269,8 @@ class WyckoffCDVAE(BaseModule):
             cnt = int(num_sites_cpu[i].item())
             n = min(cnt, S)
             if n > 0:
-                masked_sites[i, :n] = elem_mask[offset:offset + n]
+                masked_elem_sites[i, :n] = elem_mask[offset:offset + n]
+                masked_letter_sites[i, :n] = letter_mask[offset:offset + n]
             offset += cnt
 
         # 构建noisy_elem_ids：masked位点置0（MASK token），其余保留原始元素ID
@@ -233,11 +278,11 @@ class WyckoffCDVAE(BaseModule):
         # 及 decode_to_wyckoff 生成端的 +1 对齐（否则训练/生成错位一格，
         # 且 elem_target=0 会与 MASK 撞车）
         noisy_elem_ids = targets['elem_target'] + 1  # (B, max_sites)
-        noisy_elem_ids[masked_sites] = 0  # 0 = MASK token
+        noisy_elem_ids[masked_elem_sites] = 0  # 0 = MASK token
 
-        # letter diffusion: 同一批masked位点也mask letter
+        # letter diffusion 使用自己的 mask，不再复用 element mask。
         noisy_letter_ids = targets['letter_target'] + 1  # (B, max_sites)
-        noisy_letter_ids[masked_sites] = 0  # 0 = MASK token
+        noisy_letter_ids[masked_letter_sites] = 0  # 0 = MASK token
 
         # 对per-site latent reparameterize（仅valid sites）
         per_site_log_var = torch.nan_to_num(
@@ -267,14 +312,93 @@ class WyckoffCDVAE(BaseModule):
             p_uncond = getattr(self.hparams, 'cfg_p_uncond', 0.15)
             cfg_drop = torch.rand(B, device=device) < p_uncond
 
-        # ── 双路径监督：conditional site prior 与生成路径完全一致 ──
-        projector_per_site_z, site_prior_mu, site_prior_log_var = (
-            self.decoder.sample_site_prior(
+        # 两条路径共享同一组 global predictions。
+        target_spg_nums = targets['spg_target'] + 1
+        target_n_sites = targets['num_sites_target'] + 1
+        global_state = self.decoder.global_predictions(
+            z,
+            lattice_spg=target_spg_nums,
+            stability_cond=stability_cond,
+            cfg_drop=cfg_drop,
+        )
+
+        if self.decoder.use_joint_site_planner:
+            predicted_spg_nums = global_state[1].detach().argmax(dim=-1) + 1
+            predicted_n_sites = global_state[3].detach().argmax(dim=-1) + 1
+
+            if self.training:
+                planner_context_pred_prob = _linear_ramp(
+                    getattr(self, 'current_epoch', 0),
+                    getattr(self.hparams, 'planner_context_mix_start_epoch', 10),
+                    getattr(self.hparams, 'planner_context_mix_end_epoch', 100),
+                    getattr(self.hparams, 'planner_context_mix_max_prob', 0.5),
+                )
+                use_predicted_context = (
+                    torch.rand(B, device=device) < planner_context_pred_prob
+                )
+            elif bool(getattr(
+                self.hparams, 'planner_eval_use_predicted_context', True
+            )):
+                planner_context_pred_prob = 1.0
+                use_predicted_context = torch.ones(
+                    B, dtype=torch.bool, device=device
+                )
+            else:
+                planner_context_pred_prob = 0.0
+                use_predicted_context = torch.zeros(
+                    B, dtype=torch.bool, device=device
+                )
+
+            planner_spg_nums = torch.where(
+                use_predicted_context, predicted_spg_nums, target_spg_nums
+            )
+            planner_n_sites = torch.where(
+                use_predicted_context, predicted_n_sites, target_n_sites
+            ).clamp(1, S)
+            planner_padding_mask = (
+                torch.arange(S, device=device).unsqueeze(0)
+                >= planner_n_sites.unsqueeze(1)
+            )
+
+            # Deterministic joint planner: learned site queries jointly attend to
+            # global, element, stability, SPG and site-count context. During
+            # training, predicted SPG/site count are introduced by a curriculum;
+            # evaluation defaults to the generation-time predicted context.
+            projector_per_site_z = self.decoder.plan_site_latents(
                 z,
+                elem_cond=elem_cond,
                 stability_cond=stability_cond,
                 cfg_drop=cfg_drop,
+                spg_nums=planner_spg_nums,
+                n_sites=planner_n_sites,
+                site_padding_mask=planner_padding_mask,
+                global_state=global_state,
             )
-        )
+            site_prior_mu = None
+            site_prior_log_var = None
+        else:
+            planner_context_pred_prob = 0.0
+            use_predicted_context = torch.zeros(
+                B, dtype=torch.bool, device=device
+            )
+            predicted_spg_nums = target_spg_nums
+            predicted_n_sites = target_n_sites
+            # Legacy factorized Gaussian prior, retained as an ablation switch.
+            projector_per_site_z, site_prior_mu, site_prior_log_var = (
+                self.decoder.sample_site_prior(
+                    z,
+                    stability_cond=stability_cond,
+                    cfg_drop=cfg_drop,
+                    detach_std_for_recon=(
+                        self.training
+                        and bool(getattr(
+                            self.hparams,
+                            'site_prior_detach_std_for_recon',
+                            True,
+                        ))
+                    ),
+                )
+            )
 
         # decoder：noisy条件 + per-site latent z（双路径共享除per_site_z外的所有输入）
         preds_encoder = self.decoder(
@@ -287,7 +411,8 @@ class WyckoffCDVAE(BaseModule):
             elem_cond=elem_cond,
             stability_cond=stability_cond,
             cfg_drop=cfg_drop,
-            lattice_spg=targets['spg_target'] + 1,
+            lattice_spg=target_spg_nums,
+            global_state=global_state,
         )
 
         preds_projector = self.decoder(
@@ -300,15 +425,24 @@ class WyckoffCDVAE(BaseModule):
             elem_cond=elem_cond,
             stability_cond=stability_cond,
             cfg_drop=cfg_drop,
-            lattice_spg=targets['spg_target'] + 1,
+            lattice_spg=target_spg_nums,
+            global_state=global_state,
         )
 
         # loss conduct
         recon_loss_encoder, loss_dict_encoder = self.recon_loss(
-            preds_encoder, targets, site_mask, masked_sites=masked_sites
+            preds_encoder,
+            targets,
+            site_mask,
+            masked_elem_sites=masked_elem_sites,
+            masked_letter_sites=masked_letter_sites,
         )
         recon_loss_projector, loss_dict_projector = self.recon_loss(
-            preds_projector, targets, site_mask, masked_sites=masked_sites
+            preds_projector,
+            targets,
+            site_mask,
+            masked_elem_sites=masked_elem_sites,
+            masked_letter_sites=masked_letter_sites,
         )
         encoder_loss_weight = max(
             float(getattr(self.hparams, 'site_z_encoder_loss_weight', 0.3)), 0.0
@@ -340,15 +474,44 @@ class WyckoffCDVAE(BaseModule):
         # Global KL
         kld_loss = self.kld_loss(mu, log_var)
 
-        # Per-site conditional KL（只对valid sites计算）
+        # Site alignment only uses valid sites. In planner mode the encoder mean
+        # is a stop-gradient teacher; no Gaussian site KL is needed.
         site_valid = ~enc_padding_mask  # (B, max_sites), True=valid
-        kld_site = self.conditional_site_kld(
-            per_site_mu,
-            per_site_log_var,
-            site_prior_mu,
-            site_prior_log_var,
-            site_valid,
-        )
+        zero = mu.new_zeros(())
+        if self.decoder.use_joint_site_planner:
+            planner_alignment = self.site_planner_alignment(
+                projector_per_site_z,
+                per_site_mu,
+                site_valid,
+            )
+            kld_site = zero
+            site_prior_metrics = {}
+        else:
+            planner_alignment = {
+                'mse': zero,
+                'cosine_loss': zero,
+                'scale_loss': zero,
+                'planner_std': zero,
+                'posterior_std': zero,
+                'std_ratio': zero,
+            }
+            kld_site = self.conditional_site_kld(
+                per_site_mu,
+                per_site_log_var,
+                site_prior_mu,
+                site_prior_log_var,
+                site_valid,
+                detach_posterior=bool(getattr(
+                    self.hparams, 'site_prior_detach_posterior', True
+                )),
+            )
+            site_prior_metrics = self.site_prior_diagnostics(
+                per_site_mu,
+                per_site_log_var,
+                site_prior_mu,
+                site_prior_log_var,
+                site_valid,
+            )
 
         if self.hparams.predict_property and hasattr(batch, 'y'):
             property_loss = F.mse_loss(self.fc_property(z).squeeze(-1), batch.y)
@@ -363,10 +526,58 @@ class WyckoffCDVAE(BaseModule):
         kld_site = torch.nan_to_num(kld_site, nan=0.0, posinf=0.0, neginf=0.0)
         property_loss = torch.nan_to_num(property_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if self.decoder.use_joint_site_planner:
+            site_kl_scale = 0.0
+            planner_mse_weight = max(float(getattr(
+                self.hparams, 'site_planner_mse_weight', 0.1
+            )), 0.0)
+            planner_cosine_weight = max(float(getattr(
+                self.hparams, 'site_planner_cosine_weight', 0.1
+            )), 0.0)
+            planner_scale_weight = max(float(getattr(
+                self.hparams, 'site_planner_scale_weight', 0.05
+            )), 0.0)
+            site_regularization = (
+                planner_mse_weight * planner_alignment['mse']
+                + planner_cosine_weight * planner_alignment['cosine_loss']
+                + planner_scale_weight * planner_alignment['scale_loss']
+            )
+        else:
+            # Legacy conditional site-KL warm-up, used only for ablation.
+            site_kl_scale_start = float(getattr(
+                self.hparams,
+                'site_prior_kl_scale_start',
+                getattr(self.hparams, 'site_prior_kl_scale', 0.1),
+            ))
+            site_kl_scale_max = float(getattr(
+                self.hparams,
+                'site_prior_kl_scale_max',
+                getattr(self.hparams, 'site_prior_kl_scale', 0.1),
+            ))
+            site_kl_warmup_epochs = max(int(getattr(
+                self.hparams, 'site_prior_kl_warmup_epochs', 0
+            )), 0)
+            if site_kl_warmup_epochs > 0:
+                site_kl_progress = min(
+                    max(float(getattr(self, 'current_epoch', 0)), 0.0)
+                    / float(site_kl_warmup_epochs),
+                    1.0,
+                )
+                site_kl_scale = (
+                    site_kl_scale_start
+                    + (site_kl_scale_max - site_kl_scale_start) * site_kl_progress
+                )
+            else:
+                site_kl_scale = site_kl_scale_max
+            planner_mse_weight = 0.0
+            planner_cosine_weight = 0.0
+            planner_scale_weight = 0.0
+            site_regularization = self.hparams.beta * site_kl_scale * kld_site
+
         # total loss
         regularization_loss = (
             self.hparams.beta * kld_loss
-            + self.hparams.beta * getattr(self.hparams, 'site_prior_kl_scale', 0.1) * kld_site
+            + site_regularization
             + self.hparams.cost_property * property_loss
         )
         total_loss = (
@@ -380,6 +591,7 @@ class WyckoffCDVAE(BaseModule):
         projector_total_loss = (
             recon_loss_projector
             + self.hparams.beta * kld_loss
+            + site_regularization
             + self.hparams.cost_property * property_loss
         )
 
@@ -392,9 +604,34 @@ class WyckoffCDVAE(BaseModule):
             'kld_loss': kld_loss,
             'kld_site': kld_site,
             'kld_site_conditional': kld_site,
-            'site_prior_std': torch.exp(0.5 * site_prior_log_var).mean(),
+            'site_prior_kl_scale': site_kl_scale,
+            'site_prior_kl_weight': float(self.hparams.beta) * site_kl_scale,
+            'site_planner_mse': planner_alignment['mse'],
+            'site_planner_cosine_loss': planner_alignment['cosine_loss'],
+            'site_planner_cosine_similarity': (
+                1.0 - planner_alignment['cosine_loss']
+            ),
+            'site_planner_std': planner_alignment['planner_std'],
+            'site_planner_posterior_std': planner_alignment['posterior_std'],
+            'site_planner_std_ratio': planner_alignment['std_ratio'],
+            'site_planner_scale_loss': planner_alignment['scale_loss'],
+            'site_planner_mse_weight': planner_mse_weight,
+            'site_planner_cosine_weight': planner_cosine_weight,
+            'site_planner_scale_weight': planner_scale_weight,
+            'site_planner_regularization': site_regularization,
+            'planner_context_pred_prob': planner_context_pred_prob,
+            'planner_context_pred_fraction': (
+                use_predicted_context.float().mean()
+            ),
+            'planner_context_spg_accuracy': (
+                predicted_spg_nums == target_spg_nums
+            ).float().mean(),
+            'planner_context_nsites_accuracy': (
+                predicted_n_sites == target_n_sites
+            ).float().mean(),
             'property_loss': property_loss,
         })
+        loss_dict.update(site_prior_metrics)
         return total_loss, loss_dict
 
     def _prepare_targets(self, batch):
@@ -502,13 +739,101 @@ class WyckoffCDVAE(BaseModule):
         )
 
     @staticmethod
+    def site_planner_alignment(planned_site_z, posterior_mu, site_valid):
+        """Match the generation-time planner to encoder site means.
+
+        The posterior is a stop-gradient teacher. Both objectives are averaged
+        over valid sites only, so structures with fewer sites are not penalized
+        by padded slots.
+        """
+        if planned_site_z.shape != posterior_mu.shape:
+            raise ValueError(
+                'Joint Site Planner output and encoder per-site mean must have '
+                f'the same shape, got {tuple(planned_site_z.shape)} and '
+                f'{tuple(posterior_mu.shape)}. Set latent_dim == hidden_dim.'
+            )
+        planned_site_z = torch.nan_to_num(
+            planned_site_z, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        posterior_mu = torch.nan_to_num(
+            posterior_mu.detach(), nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        mask = site_valid.unsqueeze(-1).to(planned_site_z.dtype)
+        site_count = mask.sum().clamp(min=1.0)
+        dim_count = site_count * float(planned_site_z.shape[-1])
+
+        mse = ((planned_site_z - posterior_mu).pow(2) * mask).sum() / dim_count
+        cosine_distance = 1.0 - F.cosine_similarity(
+            planned_site_z, posterior_mu, dim=-1, eps=1e-8
+        )
+        cosine_loss = (
+            cosine_distance * site_valid.to(cosine_distance.dtype)
+        ).sum() / site_count
+
+        # Align relative latent scale per crystal. A log-standard-deviation
+        # objective penalizes ratio mismatch more usefully than absolute error.
+        dims_per_crystal = (
+            mask.sum(dim=(1, 2)) * float(planned_site_z.shape[-1])
+        ).clamp(min=1.0)
+        planner_mean = (
+            planned_site_z * mask
+        ).sum(dim=(1, 2)) / dims_per_crystal
+        posterior_mean = (
+            posterior_mu * mask
+        ).sum(dim=(1, 2)) / dims_per_crystal
+        planner_var = (
+            (planned_site_z - planner_mean[:, None, None]).pow(2) * mask
+        ).sum(dim=(1, 2)) / dims_per_crystal
+        posterior_var = (
+            (posterior_mu - posterior_mean[:, None, None]).pow(2) * mask
+        ).sum(dim=(1, 2)) / dims_per_crystal
+        planner_std_per_crystal = planner_var.clamp(min=1e-8).sqrt()
+        posterior_std_per_crystal = posterior_var.clamp(min=1e-8).sqrt()
+        valid_crystal = site_valid.any(dim=1).to(planned_site_z.dtype)
+        valid_crystal_count = valid_crystal.sum().clamp(min=1.0)
+        log_std_delta = (
+            torch.log(planner_std_per_crystal.clamp(min=1e-4))
+            - torch.log(posterior_std_per_crystal.clamp(min=1e-4))
+        )
+        scale_loss = (
+            log_std_delta.pow(2) * valid_crystal
+        ).sum() / valid_crystal_count
+        planner_std = (
+            planner_std_per_crystal * valid_crystal
+        ).sum() / valid_crystal_count
+        posterior_std = (
+            posterior_std_per_crystal * valid_crystal
+        ).sum() / valid_crystal_count
+        std_ratio = (
+            planner_std_per_crystal
+            / posterior_std_per_crystal.clamp(min=1e-4)
+            * valid_crystal
+        ).sum() / valid_crystal_count
+
+        return {
+            'mse': mse,
+            'cosine_loss': cosine_loss,
+            'scale_loss': scale_loss,
+            'planner_std': planner_std,
+            'posterior_std': posterior_std,
+            'std_ratio': std_ratio,
+        }
+
+    @staticmethod
     def conditional_site_kld(
         posterior_mu,
         posterior_log_var,
         prior_mu,
         prior_log_var,
         site_valid,
+        detach_posterior=True,
     ):
+        # Encoder posterior is the teacher. Prevent a weak prior from pulling
+        # the better reconstruction path toward itself; gradients still update
+        # the prior and the global latent feeding it.
+        if detach_posterior:
+            posterior_mu = posterior_mu.detach()
+            posterior_log_var = posterior_log_var.detach()
         posterior_mu = torch.nan_to_num(
             posterior_mu, nan=0.0, posinf=1e4, neginf=-1e4
         )
@@ -532,6 +857,67 @@ class WyckoffCDVAE(BaseModule):
         )
         site_valid = site_valid.unsqueeze(-1).to(kld.dtype)
         return (kld * site_valid).sum() / site_valid.sum().clamp(min=1.0)
+
+    @staticmethod
+    def site_prior_diagnostics(
+        posterior_mu,
+        posterior_log_var,
+        prior_mu,
+        prior_log_var,
+        site_valid,
+    ):
+        """Return valid-site-only posterior/prior alignment diagnostics."""
+        with torch.no_grad():
+            posterior_log_var = torch.nan_to_num(
+                posterior_log_var, nan=-10.0, posinf=2.0, neginf=-10.0
+            ).clamp(-10.0, 2.0)
+            prior_log_var = torch.nan_to_num(
+                prior_log_var, nan=-10.0, posinf=2.0, neginf=-10.0
+            ).clamp(-10.0, 2.0)
+            posterior_mu = torch.nan_to_num(
+                posterior_mu, nan=0.0, posinf=1e4, neginf=-1e4
+            )
+            prior_mu = torch.nan_to_num(
+                prior_mu, nan=0.0, posinf=1e4, neginf=-1e4
+            )
+
+            mask = site_valid.unsqueeze(-1).to(prior_mu.dtype)
+            site_count = mask.sum().clamp(min=1.0)
+            dim_count = site_count * float(prior_mu.shape[-1])
+            posterior_std_tensor = torch.exp(0.5 * posterior_log_var)
+            prior_std_tensor = torch.exp(0.5 * prior_log_var)
+            posterior_std = (posterior_std_tensor * mask).sum() / dim_count
+            prior_std = (prior_std_tensor * mask).sum() / dim_count
+
+            mean_sq = (posterior_mu - prior_mu).pow(2)
+            prior_var = prior_log_var.exp().clamp(min=1e-8)
+            variance_term = 0.5 * (
+                prior_log_var
+                - posterior_log_var
+                + posterior_log_var.exp() / prior_var
+                - 1.0
+            )
+            mean_term = 0.5 * mean_sq / prior_var
+
+            return {
+                'site_posterior_std': posterior_std,
+                'site_prior_std': prior_std,
+                'site_prior_posterior_std_ratio': (
+                    prior_std / posterior_std.clamp(min=1e-8)
+                ),
+                'site_prior_mu_mse': (mean_sq * mask).sum() / dim_count,
+                'site_prior_logvar_mae': (
+                    (posterior_log_var - prior_log_var).abs() * mask
+                ).sum() / dim_count,
+                # Per-site sums over latent dimensions; together they should
+                # approximately equal kld_site_conditional.
+                'site_kl_mean_component': (
+                    mean_term * mask
+                ).sum() / site_count,
+                'site_kl_variance_component': (
+                    variance_term * mask
+                ).sum() / site_count,
+            }
 
    
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:

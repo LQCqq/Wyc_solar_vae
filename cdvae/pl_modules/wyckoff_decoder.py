@@ -95,6 +95,47 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _progressive_token_remask(
+    sampled_ids,
+    confidence,
+    valid_mask,
+    step,
+    total_steps,
+    schedule_power=1.0,
+):
+    """Keep the most confident tokens and remask the rest for the next step.
+
+    ``step`` counts down from ``total_steps`` to 1. At the first reverse step
+    only a small high-confidence subset is retained; at step 1 every valid site
+    is retained. Recomputing the ranking every step allows an earlier decision
+    to be replaced instead of becoming permanently frozen.
+    """
+    if sampled_ids.shape != confidence.shape or sampled_ids.shape != valid_mask.shape:
+        raise ValueError(
+            'sampled_ids, confidence and valid_mask must have the same shape.'
+        )
+    total_steps = max(int(total_steps), 1)
+    step = min(max(int(step), 1), total_steps)
+    power = max(float(schedule_power), 1e-6)
+    progress = float(total_steps - step + 1) / float(total_steps)
+    keep_fraction = min(max(progress ** power, 0.0), 1.0)
+
+    next_ids = torch.zeros_like(sampled_ids)
+    for batch_idx in range(sampled_ids.shape[0]):
+        valid_indices = torch.where(valid_mask[batch_idx])[0]
+        n_valid = int(valid_indices.numel())
+        if n_valid == 0:
+            continue
+        n_keep = max(1, min(n_valid, int(math.ceil(n_valid * keep_fraction))))
+        valid_confidence = confidence[batch_idx, valid_indices]
+        keep_local = torch.topk(
+            valid_confidence, k=n_keep, largest=True, sorted=False
+        ).indices
+        keep_indices = valid_indices[keep_local]
+        next_ids[batch_idx, keep_indices] = sampled_ids[batch_idx, keep_indices]
+    return next_ids
+
+
 
 class WyckoffDecoder(nn.Module):
     """
@@ -115,6 +156,12 @@ class WyckoffDecoder(nn.Module):
         num_stability_classes: int = 4,
         site_prior_logvar_min: float = -10.0,
         site_prior_logvar_max: float = 2.0,
+        use_joint_site_planner: bool = False,
+        site_planner_num_layers: int = 2,
+        site_planner_num_heads: int = 4,
+        site_planner_dropout: float = 0.1,
+        iterative_site_refinement: bool = True,
+        site_remask_power: float = 1.0,
     ):
         super().__init__()
         self.max_sites = max_sites
@@ -126,6 +173,9 @@ class WyckoffDecoder(nn.Module):
         self.stability_null_class = num_stability_classes
         self.site_prior_logvar_min = site_prior_logvar_min
         self.site_prior_logvar_max = site_prior_logvar_max
+        self.use_joint_site_planner = bool(use_joint_site_planner)
+        self.iterative_site_refinement = bool(iterative_site_refinement)
+        self.site_remask_power = max(float(site_remask_power), 1e-6)
         
         # 特征
         self.fc_shared = nn.Sequential(
@@ -205,6 +255,14 @@ class WyckoffDecoder(nn.Module):
         # cross-attention：decoder site特征attend到per-site latent z
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
         self.cross_attn_norm = nn.LayerNorm(hidden_dim)
+        # Preserve the one-to-one slot correspondence before global cross-site
+        # mixing. Otherwise attention may average similar planner tokens and
+        # discard site-specific element information.
+        self.site_latent_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.site_latent_fusion_norm = nn.LayerNorm(hidden_dim)
         self.site_self_attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True)
         self.site_self_attn_norm = nn.LayerNorm(hidden_dim)
         self.site_ffn = nn.Sequential(
@@ -214,24 +272,60 @@ class WyckoffDecoder(nn.Module):
         )
         self.site_ffn_norm = nn.LayerNorm(hidden_dim)
 
-        # site_z_projector 从全局z派生per-site z
-        self.site_z_projector = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
-        self.site_prior = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
-        self.site_prior_log_var = nn.Linear(hidden_dim, hidden_dim)
-        nn.init.zeros_(self.site_prior_log_var.weight)
-        nn.init.constant_(self.site_prior_log_var.bias, math.log(0.2 ** 2))
+        if self.use_joint_site_planner:
+            # Joint set planner: all site slots attend to shared structural
+            # context and to each other. No factorized Gaussian site prior.
+            self.site_planner_queries = nn.Embedding(max_sites, hidden_dim)
+            self.site_planner_global_proj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+            )
+            self.site_planner_spg_emb = nn.Embedding(num_spg + 1, hidden_dim)
+            self.site_planner_nsites_emb = nn.Embedding(max_sites + 1, hidden_dim)
+            self.site_planner_context_norm = nn.LayerNorm(hidden_dim)
+            planner_layer = nn.TransformerDecoderLayer(
+                d_model=hidden_dim,
+                nhead=site_planner_num_heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=site_planner_dropout,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True,
+            )
+            self.site_planner = nn.TransformerDecoder(
+                planner_layer,
+                num_layers=max(int(site_planner_num_layers), 1),
+                norm=nn.LayerNorm(hidden_dim),
+            )
+            self.site_planner_out = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+        else:
+            # Legacy factorized Gaussian conditional site prior.
+            self.site_z_projector = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+            self.site_prior = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+            self.site_prior_log_var = nn.Linear(hidden_dim, hidden_dim)
+            self.site_prior_stability_proj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+            )
+            nn.init.zeros_(self.site_prior_log_var.weight)
+            nn.init.constant_(self.site_prior_log_var.bias, math.log(0.2 ** 2))
 
         # ── CFG 元素条件（阶段1）：结构级 multi-hot(100) → hidden_dim ──
         # 训练时注入"该结构含哪些元素"，生成时注入"想要哪些元素(如硫族)"。
@@ -254,13 +348,6 @@ class WyckoffDecoder(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.site_prior_stability_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-        )
-
-
     def _stability_features(self, z, stability_cond=None, cfg_drop=None):
         """Return a (B, hidden_dim) stability feature, including null CFG rows."""
         B = z.shape[0]
@@ -298,7 +385,100 @@ class WyckoffDecoder(nn.Module):
                 stability_ids = torch.where(drop, null_ids, stability_ids)
         return self.stability_cond_proj(self.stability_emb(stability_ids))
 
+    def _element_condition_features(self, z, elem_cond=None, cfg_drop=None):
+        """Return a (B, hidden_dim) element-condition feature with CFG nulls."""
+        B = z.shape[0]
+        null_feat = self.null_elem_cond.unsqueeze(0).expand(B, -1)
+        if elem_cond is None:
+            return null_feat
+        elem_cond = torch.as_tensor(
+            elem_cond, dtype=z.dtype, device=z.device
+        ).view(-1, self.num_elements)
+        if elem_cond.shape[0] == 1 and B > 1:
+            elem_cond = elem_cond.expand(B, -1)
+        if elem_cond.shape[0] != B:
+            raise ValueError(
+                f'elem_cond has {elem_cond.shape[0]} rows; expected {B}.'
+            )
+        cond_feat = self.elem_cond_proj(elem_cond)
+        if cfg_drop is not None:
+            drop = torch.as_tensor(
+                cfg_drop, dtype=torch.bool, device=z.device
+            ).view(-1)
+            if drop.numel() != B:
+                raise ValueError(f'cfg_drop has {drop.numel()} rows; expected {B}.')
+            cond_feat = torch.where(drop.unsqueeze(1), null_feat, cond_feat)
+        return cond_feat
+
+    def plan_site_latents(
+        self,
+        z,
+        elem_cond=None,
+        stability_cond=None,
+        cfg_drop=None,
+        spg_nums=None,
+        n_sites=None,
+        site_padding_mask=None,
+        global_state=None,
+    ):
+        """Jointly plan all per-site latent tokens from global conditions."""
+        if not self.use_joint_site_planner:
+            raise RuntimeError('Joint site planner is disabled for this decoder.')
+
+        B = z.shape[0]
+        if global_state is None:
+            global_state = self.global_predictions(
+                z,
+                stability_cond=stability_cond,
+                cfg_drop=cfg_drop,
+            )
+        h_global, spg_logits, _, num_sites_logits = global_state
+        if spg_nums is None:
+            spg_nums = spg_logits.argmax(dim=-1) + 1
+        if n_sites is None:
+            n_sites = num_sites_logits.argmax(dim=-1) + 1
+        spg_nums = torch.as_tensor(
+            spg_nums, dtype=torch.long, device=z.device
+        ).view(-1).clamp(1, self.num_spg)
+        n_sites = torch.as_tensor(
+            n_sites, dtype=torch.long, device=z.device
+        ).view(-1).clamp(1, self.max_sites)
+
+        context = torch.stack([
+            self.site_planner_global_proj(h_global),
+            self._stability_features(
+                z, stability_cond=stability_cond, cfg_drop=cfg_drop
+            ),
+            self._element_condition_features(
+                z, elem_cond=elem_cond, cfg_drop=cfg_drop
+            ),
+            self.site_planner_spg_emb(spg_nums),
+            self.site_planner_nsites_emb(n_sites),
+        ], dim=1)
+        context = self.site_planner_context_norm(context)
+
+        queries = self.site_planner_queries.weight.unsqueeze(0).expand(B, -1, -1)
+        planner_mask = (
+            site_padding_mask.clone()
+            if site_padding_mask is not None
+            else torch.arange(self.max_sites, device=z.device).unsqueeze(0)
+                 >= n_sites.unsqueeze(1)
+        )
+        all_pad = planner_mask.all(dim=1)
+        if all_pad.any():
+            planner_mask[all_pad, 0] = False
+        planned = self.site_planner(
+            tgt=queries,
+            memory=context,
+            tgt_key_padding_mask=planner_mask,
+        )
+        return self.site_planner_out(planned)
+
     def site_prior_stats(self, z, stability_cond=None, cfg_drop=None):
+        if self.use_joint_site_planner:
+            raise RuntimeError(
+                'site_prior_stats is unavailable when joint site planner is enabled.'
+            )
         B = z.shape[0]
         z_proj = self.site_z_projector(z)                           # (B, hidden_dim)
         stability_feat = self._stability_features(
@@ -317,16 +497,33 @@ class WyckoffDecoder(nn.Module):
         ).clamp(self.site_prior_logvar_min, self.site_prior_logvar_max)
         return prior_mu, prior_log_var
 
-    def sample_site_prior(self, z, stability_cond=None, cfg_drop=None, eps=None):
+    def sample_site_prior(
+        self,
+        z,
+        stability_cond=None,
+        cfg_drop=None,
+        eps=None,
+        detach_std_for_recon=False,
+    ):
         prior_mu, prior_log_var = self.site_prior_stats(
             z, stability_cond=stability_cond, cfg_drop=cfg_drop
         )
         if eps is None:
             eps = torch.randn_like(prior_mu)
-        per_site_z = prior_mu + eps * torch.exp(0.5 * prior_log_var)
+        prior_std = torch.exp(0.5 * prior_log_var)
+        # Projector reconstruction naturally prefers zero sampling noise and can
+        # therefore collapse prior_log_var. During training, detach only this
+        # reconstruction path; conditional KL still trains prior_log_var.
+        if detach_std_for_recon:
+            prior_std = prior_std.detach()
+        per_site_z = prior_mu + eps * prior_std
         return per_site_z, prior_mu, prior_log_var
 
     def build_site_z(self, z, stability_cond=None):
+        if self.use_joint_site_planner:
+            return self.plan_site_latents(
+                z, stability_cond=stability_cond
+            )
         prior_mu, _ = self.site_prior_stats(
             z, stability_cond=stability_cond
         )
@@ -457,14 +654,9 @@ class WyckoffDecoder(nn.Module):
         # ── CFG 元素条件注入（阶段1）：结构级条件广播到所有位点 ──
         # elem_cond: (B,100) multi-hot；None 时整批用 null（无条件分支）
         # cfg_drop: (B,) bool，True 的样本用 null（训练时随机丢弃）
-        B_ = site_feats.size(0)
-        null_feat = self.null_elem_cond.unsqueeze(0).expand(B_, -1)  # (B, D)
-        if elem_cond is not None:
-            cond_feat = self.elem_cond_proj(elem_cond)              # (B, D)
-            if cfg_drop is not None:
-                cond_feat = torch.where(cfg_drop.unsqueeze(1), null_feat, cond_feat)
-        else:
-            cond_feat = null_feat
+        cond_feat = self._element_condition_features(
+            z, elem_cond=elem_cond, cfg_drop=cfg_drop
+        )
         site_feats = site_feats + cond_feat.unsqueeze(1)           # 广播到 (B, max_sites, D)
 
         if site_padding_mask is None:
@@ -482,6 +674,19 @@ class WyckoffDecoder(nn.Module):
 
         # cross-attention：decoder site特征attend到per-site latent z（训练/生成均可用）
         if per_site_z is not None:
+            if per_site_z.shape != site_feats.shape:
+                raise ValueError(
+                    'per_site_z must match decoder site feature shape, got '
+                    f'{tuple(per_site_z.shape)} and {tuple(site_feats.shape)}.'
+                )
+            per_site_z = torch.nan_to_num(
+                per_site_z, nan=0.0, posinf=1e4, neginf=-1e4
+            )
+            # Direct residual: decoder slot i receives planned latent i before
+            # it attends to all other site latents.
+            site_feats = self.site_latent_fusion_norm(
+                site_feats + self.site_latent_proj(per_site_z)
+            )
             # 全padding行会让softmax(全-inf)=NaN：临时放开首位，算完还原
             _enc_mask = enc_padding_mask.clone() if enc_padding_mask is not None else None
             _all_pad = _enc_mask.all(dim=1) if _enc_mask is not None else None
@@ -622,22 +827,44 @@ class WyckoffDecoder(nn.Module):
         ])  # (B, num_letters)
 
         
-        # 条件 site prior；CFG 两个分支共用同一 eps，差异只来自条件。
-        prior_mu_cond, prior_log_var_cond = self.site_prior_stats(
-            z, stability_cond=stability_cond
-        )
-        site_eps = torch.randn_like(prior_mu_cond)
-        per_site_z_cond = prior_mu_cond + site_eps * torch.exp(
-            0.5 * prior_log_var_cond
-        )
-        per_site_z_uncond = None
-        if use_cfg:
-            prior_mu_uncond, prior_log_var_uncond = self.site_prior_stats(
-                z, stability_cond=None
+        if self.use_joint_site_planner:
+            per_site_z_cond = self.plan_site_latents(
+                z,
+                elem_cond=elem_cond,
+                stability_cond=stability_cond,
+                spg_nums=spg_nums,
+                n_sites=n_sites,
+                site_padding_mask=site_padding_mask,
+                global_state=global_state_cond,
             )
-            per_site_z_uncond = prior_mu_uncond + site_eps * torch.exp(
-                0.5 * prior_log_var_uncond
+            per_site_z_uncond = None
+            if use_cfg:
+                per_site_z_uncond = self.plan_site_latents(
+                    z,
+                    elem_cond=None,
+                    stability_cond=None,
+                    spg_nums=spg_nums,
+                    n_sites=n_sites,
+                    site_padding_mask=site_padding_mask,
+                    global_state=global_state_uncond,
+                )
+        else:
+            # Legacy conditional Gaussian prior; CFG branches share eps.
+            prior_mu_cond, prior_log_var_cond = self.site_prior_stats(
+                z, stability_cond=stability_cond
             )
+            site_eps = torch.randn_like(prior_mu_cond)
+            per_site_z_cond = prior_mu_cond + site_eps * torch.exp(
+                0.5 * prior_log_var_cond
+            )
+            per_site_z_uncond = None
+            if use_cfg:
+                prior_mu_uncond, prior_log_var_uncond = self.site_prior_stats(
+                    z, stability_cond=None
+                )
+                per_site_z_uncond = prior_mu_uncond + site_eps * torch.exp(
+                    0.5 * prior_log_var_uncond
+                )
 
         noisy_elem_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
         noisy_letter_ids = torch.zeros(B, self.max_sites, dtype=torch.long, device=device)
@@ -684,6 +911,9 @@ class WyckoffDecoder(nn.Module):
             sampled_elems = torch.multinomial(
                 elem_probs.view(-1, V_), 1
             ).view(B_, S_) + 1  # 1-indexed元素ID
+            elem_confidence = elem_probs.gather(
+                -1, (sampled_elems - 1).unsqueeze(-1)
+            ).squeeze(-1)
 
             # 对所有位点采样letter（SPG约束）
             letter_probs = torch.softmax(preds['letter_logits'] / temperature, dim=-1)  # (B, S, 27)
@@ -693,15 +923,57 @@ class WyckoffDecoder(nn.Module):
             sampled_letters = torch.multinomial(
                 letter_probs.view(-1, L_), 1
             ).view(B_, S_) + 1  # 1-indexed letter ID
+            letter_confidence = letter_probs.gather(
+                -1, (sampled_letters - 1).unsqueeze(-1)
+            ).squeeze(-1)
 
-            unmask_prob = 1.0 / step
-            should_unmask = torch.rand(B, self.max_sites, device=device) < unmask_prob
-
-    
-            still_masked = (noisy_elem_ids == 0)
-            update = still_masked & should_unmask & ~site_padding_mask
-            noisy_elem_ids = torch.where(update, sampled_elems, noisy_elem_ids)
-            noisy_letter_ids = torch.where(update, sampled_letters, noisy_letter_ids)
+            valid_sites = ~site_padding_mask
+            if self.iterative_site_refinement:
+                # Element and letter rank confidence independently. Every step
+                # predicts candidates for every valid site; low-confidence
+                # choices are remasked, so an early wrong choice can be revised.
+                noisy_elem_ids = _progressive_token_remask(
+                    sampled_elems,
+                    elem_confidence,
+                    valid_sites,
+                    step=step,
+                    total_steps=self.T,
+                    schedule_power=self.site_remask_power,
+                )
+                noisy_letter_ids = _progressive_token_remask(
+                    sampled_letters,
+                    letter_confidence,
+                    valid_sites,
+                    step=step,
+                    total_steps=self.T,
+                    schedule_power=self.site_remask_power,
+                )
+            else:
+                # Backward-compatible monotonic decoding, but the two heads now
+                # still receive independent random unmask decisions.
+                unmask_prob = 1.0 / step
+                should_unmask_elem = (
+                    torch.rand(B, self.max_sites, device=device) < unmask_prob
+                )
+                should_unmask_letter = (
+                    torch.rand(B, self.max_sites, device=device) < unmask_prob
+                )
+                update_elem = (
+                    (noisy_elem_ids == 0)
+                    & should_unmask_elem
+                    & valid_sites
+                )
+                update_letter = (
+                    (noisy_letter_ids == 0)
+                    & should_unmask_letter
+                    & valid_sites
+                )
+                noisy_elem_ids = torch.where(
+                    update_elem, sampled_elems, noisy_elem_ids
+                )
+                noisy_letter_ids = torch.where(
+                    update_letter, sampled_letters, noisy_letter_ids
+                )
 
         
         t_final = torch.ones(B, dtype=torch.long, device=device)

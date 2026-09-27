@@ -12,12 +12,17 @@
 
 #PBS -j oe
 
-export UV_CACHE_DIR=/srv/scratch/ml4matdis/Quanli_Project/.cache/uv
-mkdir -p $UV_CACHE_DIR
-export HF_HOME=/srv/scratch/ml4matdis/Quanli_Project/.cache/huggingface
-mkdir -p $HF_HOME
+#PBS -o /srv/scratch/ml4matdis/Quanli_Project/EGS/HMTC/logs/train_test.log
 
-cd /srv/scratch/ml4matdis/Quanli_Project/z5561341/lemat-genbench
-source /srv/scratch/z5561341/miniconda3/bin/activate
-conda activate cdvae
-uv run scripts/run_benchmarks.py --cifs /srv/scratch/ml4matdis/Quanli_Project/z5561341/SMACT_structure/formal_smact_structure --config comprehensive_multi_mlip_hull --name my_benchmark
+source /srv/scratch/ml4matdis/Quanli_Project/EGS/HMTC/venvs/hmtc/bin/activate
+
+cd /srv/scratch/ml4matdis/Quanli_Project/EGS/HMTC
+
+python -u scripts/train.py \
+  --data-dir data/mp_20_hmtc \
+  --config conf/base.yaml \
+  --output runs/debug/hmtc_mp20_debug.pt \
+  --epochs 2 \
+  --batch-size 8 \
+  --learning-rate 0.0002 \
+  --device cuda1/SMACT_structure/formal_smact_structure --config comprehensive_multi_mlip_hull --name my_benchmark

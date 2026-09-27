@@ -20,7 +20,7 @@ from cdvae.pl_data.wyckoff_utils import w2s_report
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt', type=str,
-                   default='/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-09-07/wyckoff_new/epoch=178-step=18974.ckpt')
+                   default='/srv/scratch/ml4matdis/Quanli_Project/z5561341/cdvae_outputs/hydra/singlerun/2026-09-18/wyckoff_remasked/epoch=291-step=30952.ckpt')
     p.add_argument('--out_dir', type=str,
                    default='/srv/scratch/ml4matdis/Quanli_Project/z5561341/generated_structures/charge_refactor_structure')
     p.add_argument('--num_samples', type=int, default=3500)

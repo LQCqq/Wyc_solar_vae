@@ -27,12 +27,45 @@ hidden_dim: 512
 max_wyckoff_sites: 12   # 每个晶体最多预测的wyckoff位点数
 fc_num_layers: 3
 
-# per-site latent双路径监督
+# per-site latent双路径监督：encoder路径是teacher，planner路径与生成一致
 site_z_encoder_loss_weight: 0.3
 site_z_projector_loss_weight: 0.7
 
-# conditional per-site prior
+# Joint Site Planner v2: slot-wise residual fusion + scale alignment
+# learned site queries + cross-attention to global/SPG/site-count/condition
+# + site self-attention。v2仍沿用数据集site顺序，不需要重建PKL。
+use_joint_site_planner: true
+site_planner_num_layers: 2
+site_planner_num_heads: 4
+site_planner_dropout: 0.1
+site_planner_mse_weight: 0.1
+site_planner_cosine_weight: 0.1
+# Per-crystal log-std alignment prevents planner latent scale collapse.
+site_planner_scale_weight: 0.05
+
+# Planner context curriculum：开始时使用真实SPG/site count，随后逐步混入
+# global heads的预测值，缩小训练与生成的context差异。
+planner_context_mix_start_epoch: 10
+planner_context_mix_end_epoch: 100
+planner_context_mix_max_prob: 0.5
+# validation/test使用纯预测context，更接近真实生成；因此新旧projector指标
+# 不能直接横向比较。如需复现旧评估，临时设为false。
+planner_eval_use_predicted_context: true
+
+# Element / letter 独立迭代去噪。每个t都重新预测全部有效site，分别按各自
+# 置信度保留token并重新mask低置信度token，因此早期错误可以被后续步骤修正。
+iterative_site_refinement: true
+site_remask_power: 1.0
+
+# Legacy conditional Gaussian site prior（仅当use_joint_site_planner=false）
+# 保留这些字段只用于消融实验和旧配置兼容。
 site_prior_kl_scale: 0.1
+site_prior_kl_scale_start: 0.1
+site_prior_kl_scale_max: 0.5
+site_prior_kl_warmup_epochs: 50
+# encoder posterior作为teacher；projector reconstruction不直接压缩prior std。
+site_prior_detach_posterior: true
+site_prior_detach_std_for_recon: true
 site_prior_logvar_min: -10.0
 site_prior_logvar_max: 2.0
 
@@ -40,6 +73,13 @@ site_prior_logvar_max: 2.0
 use_stability_condition: true
 num_stability_classes: 4
 cfg_p_uncond: 0.15
+
+# Element-loss 诊断
+# validation/test 使用固定 diffusion 时间步，避免每次评估采到不同噪声强度。
+eval_diffusion_t: 50
+# 只控制 overlap loss 返回 element logits 的梯度：
+# 1.0=保持当前 joint-overlap；0.0=切断；0.2=保留20%。前向 overlap 值不变。
+overlap_elem_grad_scale: 1.0
 
 
 # 损失权重
